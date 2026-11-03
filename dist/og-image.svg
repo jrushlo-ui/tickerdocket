@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">TickerDocket — Government moves. Markets react.</title>
+  <desc id="desc">Verified federal actions, documented company exposure, and the market context that matters next.</desc>
+  <rect width="1200" height="630" fill="#101a1b"/>
+  <rect x="58" y="58" width="1084" height="514" rx="18" fill="#152526" stroke="#54d2bd" stroke-width="2"/>
+  <circle cx="112" cy="122" r="10" fill="#54d2bd"/>
+  <text x="142" y="134" fill="#9ae8d9" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" letter-spacing="5">REGULATORY INTELLIGENCE TERMINAL</text>
+  <text x="112" y="292" fill="#f4f4ed" font-family="Arial, Helvetica, sans-serif" font-size="72" font-weight="700">Government moves.</text>
+  <text x="112" y="380" fill="#54d2bd" font-family="Arial, Helvetica, sans-serif" font-size="72" font-weight="700">Markets react.</text>
+  <text x="112" y="468" fill="#c7d1ce" font-family="Arial, Helvetica, sans-serif" font-size="28">Verified federal actions · documented company exposure</text>
+  <text x="112" y="528" fill="#9ae8d9" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="700">TICKERDOCKET.COM</text>
+</svg>
