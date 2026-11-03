@@ -4,7 +4,7 @@
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
-  gtag('config', 'G-2G6LEKB19E');
+  gtag('config', 'G-2G6LEKB19E', { debug_mode: new URLSearchParams(window.location.search).has('ga_debug') });
 
   (function () {
     const event = (name, params) => {
