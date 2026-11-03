@@ -1,5 +1,102 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TickerDocket — Government moves. Markets react.</title><meta name="description" content="A verified regulatory intelligence terminal connecting federal agency actions to publicly traded companies."><link rel="stylesheet" href="styles.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TickerDocket — Government moves. Markets react.</title><meta name="description" content="A verified regulatory intelligence terminal connecting federal agency actions to publicly traded companies."><link rel="stylesheet" href="styles.css"><script async src="https://www.googletagmanager.com/gtag/js?id=G-2G6LEKB19E"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-2G6LEKB19E');
+
+  (function () {
+    const event = (name, params) => {
+      if (typeof window.gtag === 'function') window.gtag('event', name, params || {});
+    };
+    const clean = (value) => (value || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const tickerFrom = (node) => {
+      const field = node && node.querySelector('.docket-fields b');
+      return clean(field && field.textContent);
+    };
+    const storyId = (node) => {
+      const heading = node && node.querySelector('h3');
+      return clean((heading && heading.textContent) || tickerFrom(node) || 'story');
+    };
+    const storyParams = (node) => ({
+      item_id: storyId(node),
+      ticker: tickerFrom(node),
+      page_location: window.location.href
+    });
+
+    document.querySelectorAll('.story').forEach((story) => {
+      story.dataset.gaStoryTracked = 'false';
+    });
+
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+            const story = entry.target;
+            if (story.dataset.gaStoryTracked !== 'true') {
+              story.dataset.gaStoryTracked = 'true';
+              event('article_view', storyParams(story));
+            }
+          }
+        });
+      }, { threshold: [0.5] });
+      document.querySelectorAll('.story').forEach((story) => observer.observe(story));
+    }
+
+    document.addEventListener('click', (clickEvent) => {
+      const link = clickEvent.target.closest('a');
+      if (!link) return;
+
+      const href = link.href || '';
+      const story = link.closest('.story');
+      const text = clean(link.textContent);
+      const isExternal = /^https?:/i.test(href) && new URL(href, window.location.href).origin !== window.location.origin;
+      const tickerPage = /(?:#|\/)\b(?:ticker|company)\b/i.test(href) || link.hasAttribute('data-ticker') || link.hasAttribute('data-company');
+
+      if (story && isExternal) {
+        event('outbound_source_click', Object.assign(storyParams(story), {
+          link_url: href,
+          link_text: text
+        }));
+      } else if (isExternal) {
+        event('outbound_click', {
+          link_url: href,
+          link_text: text,
+          link_domain: new URL(href, window.location.href).hostname
+        });
+      }
+
+      if (tickerPage) {
+        event('ticker_company_page_view', {
+          page_type: link.dataset.company ? 'company' : 'ticker',
+          ticker: clean(link.dataset.ticker),
+          link_url: href,
+          link_text: text
+        });
+      }
+
+      if (link.closest('.sponsor')) {
+        event('sponsor_ad_click', {
+          link_url: href,
+          link_text: text
+        });
+      }
+    });
+
+    const subscribe = document.querySelector('#subscribe');
+    if (subscribe) {
+      subscribe.addEventListener('submit', () => {
+        const email = subscribe.querySelector('input[type="email"]');
+        event('newsletter_signup', {
+          method: 'tickerdocket_briefing',
+          form_id: 'subscribe',
+          has_email: Boolean(email && email.value)
+        });
+      });
+    }
+  })();
+</script></head>
 <body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="#feed">Live feed</a><a href="#method">Method</a><a href="#briefing">Briefing</a><a class="nav-cta" href="#subscribe">Get the 08:00 CT edition</a></nav></header>
 <main><section class="hero"><div class="hero-copy"><p class="eyebrow"><span class="pulse"></span> REGULATORY INTELLIGENCE TERMINAL</p><h1>Government moves.<br><em>Markets react.</em></h1><p class="lede">Verified federal actions, documented company exposure, and the market context that matters next.</p><div class="hero-actions"><a class="button" href="#feed">Open live feed <span>↗</span></a><a class="text-link" href="#method">How verification works</a></div></div><aside class="docket-board"><div class="docket-board-head"><span>08:00 CT / PREMARKET</span><span><i class="live-dot"></i> LIVE</span></div><a href="#feed" class="docket-line"><span class="field-label">TICKER:</span><b>AMZN</b><span class="field-label">DOCKET:</span><strong>Whole Foods 365 supplement lot recalled</strong></a><a href="#feed" class="docket-line"><span class="field-label">TICKER:</span><b>INO</b><span class="field-label">DOCKET:</span><strong>FDA approves Voceryq immunotherapy</strong></a><a href="#feed" class="docket-line"><span class="field-label">TICKER:</span><b>BTI</b><span class="field-label">DOCKET:</span><strong>FDA authorizes 24 Velo products</strong></a><div class="docket-board-foot">NEXT DOCKET / 16:30 CT</div></aside></section>
 <section class="ticker-row"><div><small>AGENCY SIGNALS</small><strong>FDA · SEC · EPA · FEDERAL REGISTER</strong></div><div><small>VERIFIED EXPOSURE</small><strong class="teal">NO UNVERIFIED TICKERS</strong></div><div><small>EDITION WINDOW</small><strong>08:00 / 16:30 CT</strong></div></section>
