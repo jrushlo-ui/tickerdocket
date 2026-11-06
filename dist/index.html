@@ -158,5 +158,19 @@
     root.classList.remove('live-loading');
   });
 })();
+</script><script>
+(function () {
+  var nextBoundary = function () {
+    var now = new Date();
+    var parts = new Intl.DateTimeFormat('en-US', {timeZone:'America/Chicago', hour:'2-digit', minute:'2-digit', second:'2-digit', hourCycle:'h23'}).formatToParts(now);
+    var p = {};
+    parts.forEach(function (x) { p[x.type] = Number(x.value); });
+    var mins = p.minute < 30 ? 30 : 60;
+    var delay = ((mins - p.minute) * 60 - p.second) * 1000 - now.getMilliseconds() + 1500;
+    if (delay < 1000) delay = 1800000;
+    setTimeout(function () { window.location.reload(); }, delay);
+  };
+  nextBoundary();
+})();
 </script></body></html>
 
