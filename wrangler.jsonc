@@ -1,0 +1,19 @@
+{
+  "name": "tickerdocket-engine",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tickerdocket-db",
+      "database_id": "1b29f31a-40ad-4ce6-9e73-046c4df26259"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}
