@@ -25,7 +25,9 @@ const tests = [
   [context.federalNeedsReview({ title: 'Example Holdings, Inc. proposed consent order', agency: 'Federal Trade Commission' }), true, 'named company at market agency'],
   [context.federalNeedsReview({ title: 'Masimo Corporation filing', agency: 'Other' }), true, 'known public company'],
   [context.matchPublicIssuer('Masimo Corporation')?.ticker, 'MASI', 'Masimo alias'],
-  [context.matchPublicIssuer('B·R·A·H·M·S GmbH (part of Thermo Fisher Scientific)')?.ticker, 'TMO', 'parent named by applicant']
+  [context.matchPublicIssuer('B·R·A·H·M·S GmbH (part of Thermo Fisher Scientific)')?.ticker, 'TMO', 'parent named by applicant'],
+  [context.expectsFreshSourceCheck({ hour: 23, minute: 30 }), false, 'overnight monitoring pause'],
+  [context.expectsFreshSourceCheck({ hour: 9, minute: 0 }), true, 'active monitoring window']
 ];
 for (const [actual, expected, label] of tests) {
   if (actual !== expected) throw new Error(`${label}: expected ${expected}, got ${actual}`);

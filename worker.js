@@ -54,6 +54,10 @@ function schedulePlan(local) {
   return { scan: isScanSlot(local), publish: isPublishSlot(local) ? local.hour === 8 ? "morning" : "closing" : null, email: isEmailSlot(local) };
 }
 __name(schedulePlan, "schedulePlan");
+function expectsFreshSourceCheck(local) {
+  return local.hour >= 6 && (local.hour < 22 || local.hour === 22 && local.minute < 15);
+}
+__name(expectsFreshSourceCheck, "expectsFreshSourceCheck");
 function expectedEdition(local) {
   if (isMarketDay(local)) {
     if (local.hour > 16 || local.hour === 16 && local.minute >= 45) return { date: local.day, kind: "closing" };
@@ -456,7 +460,8 @@ async function activity(env) {
   const newFindings = items.filter((x) => !edition?.published_at || Date.parse(x.first_seen_at) > Date.parse(edition.published_at) || Date.parse(x.verified_at) > Date.parse(edition.published_at));
   const last = runs.filter((x) => x.ended_at).map((x) => Date.parse(x.ended_at)).filter(Number.isFinite);
   const lastScan = last.length ? new Date(Math.max(...last)).toISOString() : null;
-  const healthy = runs.length >= 3 && runs.every((x) => x.status === "ok" && x.ended_at && Date.now() - Date.parse(x.ended_at) < 75 * 6e4);
+  const refreshWindowActive = expectsFreshSourceCheck(localTime());
+  const healthy = runs.length >= 3 && runs.every((x) => x.status === "ok" && x.ended_at && (!refreshWindowActive || Date.now() - Date.parse(x.ended_at) < 75 * 6e4));
   return {
     as_of: nowISO(),
     last_scan_at: lastScan,
@@ -464,6 +469,7 @@ async function activity(env) {
     refresh_schedule: { from: "06:00", to: "21:00", every_minutes: 30, time_zone: "America/Chicago" },
     last_published_edition: edition,
     source_healthy: healthy,
+    refresh_window_active: refreshWindowActive,
     new_since_edition: newFindings,
     pending_by_source: pendingBySource,
     source_checks: runs,
@@ -684,7 +690,7 @@ async function status(env) {
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
   return {
-    version: "1.3.1-editorial-throughput-fix",
+    version: "1.3.2-editorial-throughput-fix",
     now: nowISO(),
     central: local,
     expected_edition: expected,
