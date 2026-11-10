@@ -124,6 +124,8 @@ var COMPANY_ALIASES = [
   ["BECTON DICKINSON AND COMPANY", "BDX", "Becton Dickinson", "direct"],
   ["GE HEALTHCARE TECHNOLOGIES INC", "GEHC", "GE HealthCare", "direct"],
   ["RESMED INC", "RMD", "ResMed", "direct"],
+  ["MASIMO CORPORATION", "MASI", "Masimo Corporation", "direct"],
+  ["B R A H M S GMBH PART OF THERMO FISHER SCIENTIFIC", "TMO", "Thermo Fisher Scientific Inc.", "parent-in-name"],
   ["COOPERSURGICAL INC", "COO", "CooperCompanies", "affiliate-review"],
   ["ETHICON INC", "JNJ", "Johnson & Johnson", "affiliate-review"],
   ["BARD PERIPHERAL VASCULAR INC", "BDX", "Becton Dickinson", "affiliate-review"],
@@ -255,6 +257,25 @@ function fdDoc(d) {
   return { id: "fr-" + id, source: "Federal Register public inspection", source_url: url, title: String(d.title || "Untitled"), agency: agencies, event_type: String(d.type || "notice"), action_date: d.filed_at?.slice(0, 10) || d.publication_date || null, applicant: null, device_code: null };
 }
 __name(fdDoc, "fdDoc");
+var FEDERAL_MARKET_AGENCIES = [
+  "SECURITIES AND EXCHANGE COMMISSION",
+  "FEDERAL TRADE COMMISSION",
+  "FOOD AND DRUG ADMINISTRATION",
+  "DEPARTMENT OF JUSTICE",
+  "ENVIRONMENTAL PROTECTION AGENCY",
+  "FEDERAL COMMUNICATIONS COMMISSION",
+  "FEDERAL ENERGY REGULATORY COMMISSION",
+  "NATIONAL HIGHWAY TRAFFIC SAFETY ADMINISTRATION"
+];
+function federalNeedsReview(item) {
+  const title = norm(item?.title);
+  const agency = norm(item?.agency);
+  const namesPublicCompany = COMPANY_ALIASES.some(([alias, , issuer]) => title.includes(norm(alias)) || title.includes(norm(issuer)));
+  const namesBusiness = /\b(CORPORATION|CORP|INCORPORATED|INC|LIMITED|LTD|PLC|LLC|COMPANY|HOLDINGS)\b/.test(title);
+  const marketAgency = FEDERAL_MARKET_AGENCIES.some((name) => agency.includes(name));
+  return namesPublicCompany || marketAgency && namesBusiness;
+}
+__name(federalNeedsReview, "federalNeedsReview");
 function legalName(s) {
   return norm(s).replace(/\b(CORPORATION|CORP|INCORPORATED|INC|LIMITED|LTD|PLC|CO|COMPANY)\b/g, "").replace(/\s+/g, " ").trim();
 }
@@ -279,10 +300,10 @@ async function exactSECApplicants(applicants, fetchFn = fetch) {
     for (const name of applicants) {
       if (m.has(name)) continue;
       const alias = matchPublicIssuer(name);
-      if (!alias || alias.method !== "direct") continue;
+      if (!alias || !["direct", "parent-in-name"].includes(alias.method)) continue;
       const row = byTicker.get(alias.ticker);
-      if (!row || legalName(name) !== legalName(row.name)) continue;
-      m.set(name, { ticker: alias.ticker, issuer: row.name, issuer_evidence_url: `https://www.sec.gov/edgar/browse/?CIK=${encodeURIComponent(row.cik)}`, method: "sec-direct-legal-alias" });
+      if (!row || alias.method === "direct" && legalName(name) !== legalName(row.name)) continue;
+      m.set(name, { ticker: alias.ticker, issuer: row.name, issuer_evidence_url: `https://www.sec.gov/edgar/browse/?CIK=${encodeURIComponent(row.cik)}`, method: alias.method === "parent-in-name" ? "sec-parent-named-by-applicant" : "sec-direct-legal-alias" });
     }
     return m;
   } catch (e) {
@@ -307,32 +328,45 @@ async function saveBatch(env, records, day, manualMap, secMap) {
   let inserted = 0;
   for (let i = 0; i < records.length; i += 30) {
     const b = [];
-    for (const item of records.slice(i, i + 30)) {
+    const chunk = records.slice(i, i + 30).filter((item) => item && validHttps(item.source_url));
+    const existing = chunk.length ? (await env.DB.prepare(`SELECT id FROM candidates WHERE id IN (${chunk.map(() => "?").join(",")})`).bind(...chunk.map((item) => item.id)).all()).results || [] : [];
+    const existingIds = new Set(existing.map((row) => row.id));
+    for (const item of chunk) {
       if (!item || !validHttps(item.source_url)) continue;
       const mapped = manualMap.get(norm(item.applicant)) || secMap.get(norm(item.applicant));
       const approved = !!mapped && String(item.source).startsWith("FDA") && // Subsidiary mappings need a documented issuer-to-applicant ownership link.
       (!manualMap.has(norm(item.applicant)) || norm(item.applicant) === norm(mapped.issuer) || validHttps(mapped.ownership_evidence_url));
+      const autoExcluded = String(item.source).startsWith("Federal Register") && !federalNeedsReview(item);
       const relation = mapped?.ownership_evidence_url || mapped?.issuer_evidence_url || null;
       const statement = approved ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : null;
       b.push(env.DB.prepare(`INSERT INTO candidates (id,source,source_url,title,agency,event_type,action_date,applicant,device_code,first_seen_local,first_seen_at,last_seen_at,status,ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(id) DO UPDATE SET last_seen_at=excluded.last_seen_at,source_url=excluded.source_url,
    title=excluded.title,action_date=excluded.action_date,
-   status=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN 'verified' ELSE candidates.status END,
+   status=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.status ELSE candidates.status END,
    ticker=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.ticker ELSE candidates.ticker END,
    issuer=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.issuer ELSE candidates.issuer END,
    company_evidence_url=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.company_evidence_url ELSE candidates.company_evidence_url END,
    impact_evidence_url=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.impact_evidence_url ELSE candidates.impact_evidence_url END,
    impact_note=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
-   approval_method=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.approval_method ELSE candidates.approval_method END,
-   approved_at=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? mapped.issuer_evidence_url : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : null, approved ? nowISO() : null));
-      inserted++;
+   approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method ELSE candidates.approval_method END,
+   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? mapped.issuer_evidence_url : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
+      if (!existingIds.has(item.id)) inserted++;
     }
     if (b.length) await env.DB.batch(b);
   }
   return inserted;
 }
 __name(saveBatch, "saveBatch");
+async function triagePendingFederal(env) {
+  const rows = (await env.DB.prepare("SELECT id,title,agency FROM candidates WHERE status='pending' AND source='Federal Register public inspection' LIMIT 1000").all()).results || [];
+  const reject = rows.filter((row) => !federalNeedsReview(row));
+  for (let i = 0; i < reject.length; i += 50) {
+    await env.DB.batch(reject.slice(i, i + 50).map((row) => env.DB.prepare("UPDATE candidates SET status='rejected',approval_method='auto-excluded-no-public-company',approved_at=? WHERE id=? AND status='pending'").bind(nowISO(), row.id)));
+  }
+  return { reviewed: rows.length, excluded: reject.length, retained_for_review: rows.length - reject.length };
+}
+__name(triagePendingFederal, "triagePendingFederal");
 async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) {
   const day = localTime(at).day, results = {};
   const manualMap = await mappings(env);
@@ -346,8 +380,9 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) 
       const rows = data.results.slice(0, 500).map(fdDoc).filter(Boolean);
       count = rows.length;
       const added = await saveBatch(env, rows, day, manualMap, /* @__PURE__ */ new Map());
+      const triage = await triagePendingFederal(env);
       await logRun(env, "federal", start, "ok", count, added);
-      results.federal = { ok: true, count, saved: added };
+      results.federal = { ok: true, count, inserted: added, triage };
     } catch (e) {
       await logRun(env, "federal", start, "error", count, 0, err(e));
       results.federal = { ok: false, error: err(e) };
@@ -394,7 +429,8 @@ async function activity(env) {
   const totals = await env.DB.prepare(`SELECT
       COUNT(*) AS total,
       SUM(CASE WHEN status='verified' THEN 1 ELSE 0 END) AS verified,
-      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending
+      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS excluded
     FROM candidates`).first();
   const raw = (await env.DB.prepare(`SELECT id,title,ticker,issuer,agency,event_type,action_date,source,source_url,
        company_evidence_url,impact_evidence_url,impact_note,approved_at,first_seen_at,status
@@ -431,7 +467,7 @@ async function activity(env) {
     new_since_edition: newFindings,
     pending_by_source: pendingBySource,
     source_checks: runs,
-    counts: { collected: totals?.total || 0, verified: totals?.verified || 0, pending_review: totals?.pending || 0 },
+    counts: { collected: totals?.total || 0, verified: totals?.verified || 0, pending_review: totals?.pending || 0, automatically_excluded: totals?.excluded || 0 },
     verified_findings: items,
     note: "New verified records appear between half-hour scans without rewriting immutable editions. Verified research records are not an edition. FDA data publication may lag its underlying decision date; stock-price effects are not established."
   };
@@ -648,7 +684,7 @@ async function status(env) {
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
   return {
-    version: "1.3-half-hour-automation",
+    version: "1.3.1-editorial-throughput-fix",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -743,7 +779,11 @@ async function admin(request, env) {
     const source = ["federal", "fda", "all"].includes(b.source) ? b.source : "all";
     return j({ results: await scanSource(env, source) });
   }
-  if (path === "/api/admin/publish") return j(await publish(env, b.kind, localTime()));
+  if (path === "/api/admin/publish") {
+    const local = localTime();
+    const scan = await scanSource(env, "all");
+    return j({ scan, edition: await publish(env, b.kind, local) });
+  }
   if (path === "/api/admin/mappings") {
     const applicant = String(b.applicant || "").trim(), issuer = String(b.issuer || "").trim(), ticker = String(b.ticker || "").toUpperCase().trim();
     if (applicant.length < 3 || issuer.length < 3 || !/^([A-Z]{1,7}[.\-]?[A-Z]{0,3})$/.test(ticker) || !validHttps(b.issuer_evidence_url) || b.ownership_evidence_url && !validHttps(b.ownership_evidence_url)) return message(400, "Supply a valid exact FDA applicant, ticker, issuer and HTTPS issuer evidence; ownership evidence required for subsidiaries.");
@@ -835,14 +875,14 @@ var worker_default = {
     if (plan.publish) {
       ctx.waitUntil((async () => {
         try {
+          await scanSource(env, "all", new Date(trigger.scheduledTime));
+        } catch (e) {
+          console.error("Pre-edition refresh failed", err(e));
+        }
+        try {
           await publish(env, plan.publish, local);
         } catch (e) {
           console.error("Scheduled edition failed", err(e));
-        }
-        try {
-          await scanSource(env, "all", new Date(trigger.scheduledTime));
-        } catch (e) {
-          console.error("Post-edition refresh failed", err(e));
         }
       })());
     } else if (plan.scan) {
@@ -858,3 +898,4 @@ export {
   status
 };
 //# sourceMappingURL=worker.js.map
+
