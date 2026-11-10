@@ -281,6 +281,8 @@ var FEDERAL_COMPANY_ALIASES = [
 ];
 function matchFederalIssuer(item) {
   const title = norm(item?.title);
+  const agency = norm(item?.agency);
+  if (agency.includes("SECURITIES AND EXCHANGE COMMISSION") && /SELF REGULATORY ORGANIZATIONS|PROPOSED RULE CHANGES|DEREGISTRATION UNDER THE INVESTMENT COMPANY ACT|EXEMPTION APPLICATION|^APPLICATION /.test(title)) return null;
   const match = FEDERAL_COMPANY_ALIASES.find((entry) => entry.terms.some((term) => title.includes(norm(term))));
   return match ? {
     ticker: match.ticker,
@@ -742,7 +744,7 @@ async function status(env) {
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
   return {
-    version: "1.4.0-qualified-ingest-ranking",
+    version: "1.4.1-low-signal-sec-filter",
     now: nowISO(),
     central: local,
     expected_edition: expected,
