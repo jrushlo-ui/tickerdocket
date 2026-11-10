@@ -30,6 +30,11 @@ const tests = [
   [context.matchFederalIssuer({ title: 'Proposed Rule Changes: Cboe BYX Exchange, Inc.' })?.ticker, 'CBOE', 'Federal Register named subsidiary'],
   [context.matchFederalIssuer({ title: 'Special Conditions: Gulfstream Aerospace Corporation, Model G400' })?.ticker, 'GD', 'Federal Register named operating company'],
   [context.matchFederalIssuer({ title: 'Sunshine Act meeting notice' }), null, 'Federal Register unmatched title'],
+  [context.matchFederalIssuer({ title: 'Proposed Rule Changes: Nasdaq PHLX LLC' })?.ticker, 'NDAQ', 'Federal Register Nasdaq subsidiary'],
+  [context.selectEmailItems([
+    { ticker: 'CBOE', source: 'Federal Register public inspection', title: 'Proposed Rule Changes', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' },
+    { ticker: 'COP', source: 'Federal Register public inspection', title: 'Institution of Section 206 Proceeding and Refund Effective Date', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' }
+  ])[0]?.ticker, 'COP', 'email significance ranking'],
   [context.expectsFreshSourceCheck({ hour: 23, minute: 30 }), false, 'overnight monitoring pause'],
   [context.expectsFreshSourceCheck({ hour: 9, minute: 0 }), true, 'active monitoring window']
 ];
