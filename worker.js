@@ -271,6 +271,23 @@ var FEDERAL_MARKET_AGENCIES = [
   "FEDERAL ENERGY REGULATORY COMMISSION",
   "NATIONAL HIGHWAY TRAFFIC SAFETY ADMINISTRATION"
 ];
+var FEDERAL_COMPANY_ALIASES = [
+  { terms: ["CONOCOPHILLIPS CO", "CONOCOPHILLIPS COMPANY"], ticker: "COP", issuer: "ConocoPhillips", cik: "1163165" },
+  { terms: ["CBOE BYX EXCHANGE", "CBOE BZX EXCHANGE", "CBOE EDGA EXCHANGE", "CBOE EDGX EXCHANGE", "CBOE EXCHANGE", "C2 OPTIONS EXCHANGE"], ticker: "CBOE", issuer: "Cboe Global Markets, Inc.", cik: "1374310" },
+  { terms: ["ICE CLEAR CREDIT", "ICE CLEAR EUROPE", "ICE FUTURES US", "ICE FUTURES EUROPE"], ticker: "ICE", issuer: "Intercontinental Exchange, Inc.", cik: "1571949" },
+  { terms: ["GULFSTREAM AEROSPACE CORPORATION", "GULFSTREAM AEROSPACE CORP"], ticker: "GD", issuer: "General Dynamics Corporation", cik: "40533" }
+];
+function matchFederalIssuer(item) {
+  const title = norm(item?.title);
+  const match = FEDERAL_COMPANY_ALIASES.find((entry) => entry.terms.some((term) => title.includes(norm(term))));
+  return match ? {
+    ticker: match.ticker,
+    issuer: match.issuer,
+    issuer_evidence_url: `https://www.sec.gov/edgar/browse/?CIK=${match.cik}`,
+    method: "federal-title-sec-issuer"
+  } : null;
+}
+__name(matchFederalIssuer, "matchFederalIssuer");
 function federalNeedsReview(item) {
   const title = norm(item?.title);
   const agency = norm(item?.agency);
@@ -337,24 +354,27 @@ async function saveBatch(env, records, day, manualMap, secMap) {
     const existingIds = new Set(existing.map((row) => row.id));
     for (const item of chunk) {
       if (!item || !validHttps(item.source_url)) continue;
-      const mapped = manualMap.get(norm(item.applicant)) || secMap.get(norm(item.applicant));
-      const approved = !!mapped && String(item.source).startsWith("FDA") && // Subsidiary mappings need a documented issuer-to-applicant ownership link.
+      const federalMapped = String(item.source).startsWith("Federal Register") ? matchFederalIssuer(item) : null;
+      const mapped = manualMap.get(norm(item.applicant)) || secMap.get(norm(item.applicant)) || federalMapped;
+      const approvedFDA = !!mapped && String(item.source).startsWith("FDA") && // Subsidiary mappings need a documented issuer-to-applicant ownership link.
       (!manualMap.has(norm(item.applicant)) || norm(item.applicant) === norm(mapped.issuer) || validHttps(mapped.ownership_evidence_url));
+      const approvedFederal = !!federalMapped;
+      const approved = approvedFDA || approvedFederal;
       const autoExcluded = String(item.source).startsWith("Federal Register") && !federalNeedsReview(item);
       const relation = mapped?.ownership_evidence_url || mapped?.issuer_evidence_url || null;
-      const statement = approved ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : null;
+      const statement = approvedFDA ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : approvedFederal ? `Federal Register public-inspection title explicitly names an entity mapped to ${mapped.issuer} (${mapped.ticker}); the SEC issuer record supports the listed-company identity. The regulatory notice is direct company exposure, but financial materiality is not established.` : null;
       b.push(env.DB.prepare(`INSERT INTO candidates (id,source,source_url,title,agency,event_type,action_date,applicant,device_code,first_seen_local,first_seen_at,last_seen_at,status,ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
    ON CONFLICT(id) DO UPDATE SET last_seen_at=excluded.last_seen_at,source_url=excluded.source_url,
    title=excluded.title,action_date=excluded.action_date,
-   status=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.status ELSE candidates.status END,
-   ticker=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.ticker ELSE candidates.ticker END,
-   issuer=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.issuer ELSE candidates.issuer END,
-   company_evidence_url=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.company_evidence_url ELSE candidates.company_evidence_url END,
-   impact_evidence_url=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.impact_evidence_url ELSE candidates.impact_evidence_url END,
-   impact_note=CASE WHEN candidates.status='pending' AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
-   approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method ELSE candidates.approval_method END,
-   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? mapped.issuer_evidence_url : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
+   status=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.status WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN 'verified' ELSE candidates.status END,
+   ticker=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.ticker ELSE candidates.ticker END,
+   issuer=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.issuer ELSE candidates.issuer END,
+   company_evidence_url=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.company_evidence_url ELSE candidates.company_evidence_url END,
+   impact_evidence_url=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_evidence_url ELSE candidates.impact_evidence_url END,
+   impact_note=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
+   approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approval_method ELSE candidates.approval_method END,
+   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
       if (!existingIds.has(item.id)) inserted++;
     }
     if (b.length) await env.DB.batch(b);
@@ -690,7 +710,7 @@ async function status(env) {
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
   return {
-    version: "1.3.2-editorial-throughput-fix",
+    version: "1.3.3-federal-company-verification",
     now: nowISO(),
     central: local,
     expected_edition: expected,
