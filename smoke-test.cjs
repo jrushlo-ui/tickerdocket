@@ -32,6 +32,8 @@ const tests = [
   [context.matchFederalIssuer({ title: 'Sunshine Act meeting notice' }), null, 'Federal Register unmatched title'],
   [context.matchFederalIssuer({ title: 'Proposed Rule Changes: Nasdaq PHLX LLC', agency: 'Securities and Exchange Commission' }), null, 'routine SEC exchange rule excluded'],
   [context.matchFederalIssuer({ title: 'Proposed Rule Changes: Nasdaq PHLX LLC', agency: 'Other' })?.ticker, 'NDAQ', 'Nasdaq match outside routine SEC filings'],
+  [context.matchFederalIssuer({ title: 'Special Conditions: Gulfstream Aerospace Corporation, Model G400', agency: 'Federal Aviation Administration' }), null, 'routine FAA special conditions excluded'],
+  [context.matchFederalIssuer({ title: 'Emergency grounding: Gulfstream Aerospace Corporation, Model G400', agency: 'Federal Aviation Administration' })?.ticker, 'GD', 'adverse FAA action retained'],
   [context.selectEmailItems([
     { ticker: 'CBOE', source: 'Federal Register public inspection', title: 'Proposed Rule Changes', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' },
     { ticker: 'COP', source: 'Federal Register public inspection', title: 'Institution of Section 206 Proceeding and Refund Effective Date', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' }
