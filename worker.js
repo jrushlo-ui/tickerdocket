@@ -275,7 +275,9 @@ var FEDERAL_COMPANY_ALIASES = [
   { terms: ["CONOCOPHILLIPS CO", "CONOCOPHILLIPS COMPANY"], ticker: "COP", issuer: "ConocoPhillips", cik: "1163165" },
   { terms: ["CBOE BYX EXCHANGE", "CBOE BZX EXCHANGE", "CBOE EDGA EXCHANGE", "CBOE EDGX EXCHANGE", "CBOE EXCHANGE", "C2 OPTIONS EXCHANGE"], ticker: "CBOE", issuer: "Cboe Global Markets, Inc.", cik: "1374310" },
   { terms: ["ICE CLEAR CREDIT", "ICE CLEAR EUROPE", "ICE FUTURES US", "ICE FUTURES EUROPE"], ticker: "ICE", issuer: "Intercontinental Exchange, Inc.", cik: "1571949" },
-  { terms: ["GULFSTREAM AEROSPACE CORPORATION", "GULFSTREAM AEROSPACE CORP"], ticker: "GD", issuer: "General Dynamics Corporation", cik: "40533" }
+  { terms: ["GULFSTREAM AEROSPACE CORPORATION", "GULFSTREAM AEROSPACE CORP"], ticker: "GD", issuer: "General Dynamics Corporation", cik: "40533" },
+  { terms: ["NASDAQ ISE", "NASDAQ PHLX", "NASDAQ TEXAS", "THE NASDAQ STOCK MARKET"], ticker: "NDAQ", issuer: "Nasdaq, Inc.", cik: "1120193" },
+  { terms: ["UBS ASSET MANAGEMENT"], ticker: "UBS", issuer: "UBS Group AG", cik: "1610520" }
 ];
 function matchFederalIssuer(item) {
   const title = norm(item?.title);
@@ -307,7 +309,7 @@ async function exactSECApplicants(applicants, fetchFn = fetch) {
     const r = await fetchFn(SEC, { headers: { "Accept": "application/json", "User-Agent": "TickerDocket research editorial research@tickerdocket.com" }, signal: AbortSignal.timeout(12e3) });
     if (!r.ok) throw Error("SEC issuer reference unavailable");
     const rows = await r.json(), m = /* @__PURE__ */ new Map(), headers = rows.fields || ["cik", "name", "ticker", "exchange"];
-    const byTicker = /* @__PURE__ */ new Map();
+    const byTicker = /* @__PURE__ */ new Map(), byLegalName = /* @__PURE__ */ new Map();
     for (const raw of rows.data || []) {
       const row = Object.fromEntries(headers.map((h, i) => [h, raw[i]]));
       const name = norm(row.name);
@@ -316,10 +318,17 @@ async function exactSECApplicants(applicants, fetchFn = fetch) {
       const exchange = String(row.exchange || "").toUpperCase();
       if (!/NASDAQ|NYSE|AMEX|CBOE/.test(exchange)) continue;
       byTicker.set(ticker, row);
+      const legal = legalName(name);
+      if (legal) byLegalName.set(legal, byLegalName.has(legal) ? null : row);
       if (applicants.includes(name)) m.set(name, { ticker, issuer: row.name, issuer_evidence_url: `https://www.sec.gov/edgar/browse/?CIK=${encodeURIComponent(row.cik)}`, method: "sec-exact" });
     }
     for (const name of applicants) {
       if (m.has(name)) continue;
+      const legalRow = byLegalName.get(legalName(name));
+      if (legalRow) {
+        m.set(name, { ticker: String(legalRow.ticker).toUpperCase(), issuer: legalRow.name, issuer_evidence_url: "https://www.sec.gov/edgar/browse/?CIK=" + encodeURIComponent(legalRow.cik), method: "sec-legal-name" });
+        continue;
+      }
       const alias = matchPublicIssuer(name);
       if (!alias || !["direct", "parent-in-name"].includes(alias.method)) continue;
       const row = byTicker.get(alias.ticker);
@@ -360,6 +369,7 @@ async function saveBatch(env, records, day, manualMap, secMap) {
       (!manualMap.has(norm(item.applicant)) || norm(item.applicant) === norm(mapped.issuer) || validHttps(mapped.ownership_evidence_url));
       const approvedFederal = !!federalMapped;
       const approved = approvedFDA || approvedFederal;
+      if (!approved) continue;
       const autoExcluded = String(item.source).startsWith("Federal Register") && !federalNeedsReview(item);
       const relation = mapped?.ownership_evidence_url || mapped?.issuer_evidence_url || null;
       const statement = approvedFDA ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : approvedFederal ? `Federal Register public-inspection title explicitly names an entity mapped to ${mapped.issuer} (${mapped.ticker}); the SEC issuer record supports the listed-company identity. The regulatory notice is direct company exposure, but financial materiality is not established.` : null;
@@ -584,6 +594,27 @@ async function queueMorning(env, editionId) {
  SELECT ?,id FROM subscribers WHERE status='active'`).bind(editionId).run();
 }
 __name(queueMorning, "queueMorning");
+function emailPriority(item) {
+  const text = norm((item.event_type || "") + " " + (item.title || ""));
+  let score = String(item.source).startsWith("FDA PMA") ? 90 : String(item.source).startsWith("FDA 510") ? 65 : 55;
+  if (/ORIGINAL PMA APPROVAL/.test(text)) score += 25;
+  if (/ENFORCEMENT|RECALL|COMPLAINT|PROCEEDING|REFUND|ORDER|SANCTION|INVESTIGATION/.test(text)) score += 22;
+  if (/SPECIAL CONDITIONS|AIRWORTHINESS|APPROVAL|CLEARANCE|AUTHORIZATION/.test(text)) score += 12;
+  if (/PROPOSED RULE CHANGES|DEREGISTRATION|APPLICATION/.test(text)) score -= 12;
+  if (/direct|sec-exact|sec-legal-name|federal-title-sec-issuer/i.test(item.approval_method || "")) score += 8;
+  return score;
+}
+__name(emailPriority, "emailPriority");
+function selectEmailItems(rows, limit = 10) {
+  const perTicker = /* @__PURE__ */ new Map();
+  return [...rows].sort((a, b) => emailPriority(b) - emailPriority(a) || String(b.action_date || "").localeCompare(String(a.action_date || "")) || String(a.ticker).localeCompare(String(b.ticker))).filter((item) => {
+    const count = perTicker.get(item.ticker) || 0;
+    if (count >= 2) return false;
+    perTicker.set(item.ticker, count + 1);
+    return true;
+  }).slice(0, limit);
+}
+__name(selectEmailItems, "selectEmailItems");
 async function flushMail(env, limit = 20) {
   if (!emailReady(env)) return { sent: 0, skipped: true, reason: "Email not configured" };
   const rows = (await env.DB.prepare(`SELECT q.id,q.edition_id,q.subscriber_id,q.attempts,s.email,s.unsubscribe_hash,
@@ -592,7 +623,8 @@ async function flushMail(env, limit = 20) {
  ORDER BY q.id ASC LIMIT ?`).bind(limit).all()).results || [];
   let sent = 0, failed = 0;
   for (const q of rows) {
-    const items = (await env.DB.prepare("SELECT title,ticker,source,source_url,candidate_id FROM edition_items WHERE edition_id=? ORDER BY ticker ASC LIMIT 15").bind(q.edition_id).all()).results || [];
+    const candidates = (await env.DB.prepare("SELECT i.title,i.ticker,i.source,i.source_url,i.candidate_id,i.action_date,i.event_type,c.approval_method FROM edition_items i JOIN candidates c ON c.id=i.candidate_id WHERE i.edition_id=? LIMIT 100").bind(q.edition_id).all()).results || [];
+    const items = selectEmailItems(candidates);
     const unsub = await makeUnsubscribeLink(env, q.subscriber_id);
     const link = base(env) + "/?utm_source=morning_email&utm_medium=email&utm_campaign=" + encodeURIComponent(q.local_date);
     const parts = items.map((x) => `<li><strong>${html(x.ticker)}</strong> \u2014 <a href="${html(base(env) + "/story/" + encodeURIComponent(x.candidate_id))}">${html(x.title)}</a></li>`).join("");
@@ -710,7 +742,7 @@ async function status(env) {
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
   return {
-    version: "1.3.3-federal-company-verification",
+    version: "1.4.0-qualified-ingest-ranking",
     now: nowISO(),
     central: local,
     expected_edition: expected,
