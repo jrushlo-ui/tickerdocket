@@ -780,7 +780,16 @@ async function feed(req, env) {
   else edition = await latestEdition(env);
   if (!edition) return j({ edition: null, items: [], latest: await status(env), note: "No scheduled edition has been published yet. Consult /api/activity for verified research findings and source checks." });
   const rows = await editionItems(env, edition.id);
-  return j({ edition, items: rows, latest: await status(env) });
+  let previous = null;
+  if (!day && !kind && rows.length === 0) {
+    const earlier = await env.DB.prepare(`SELECT e.id,e.local_date,e.kind FROM editions e
+      WHERE e.id < ? AND EXISTS (SELECT 1 FROM edition_items i WHERE i.edition_id=e.id)
+      ORDER BY e.id DESC LIMIT 1`).bind(edition.id).first();
+    if (earlier) {
+      previous = { edition: earlier, items: await editionItems(env, earlier.id) };
+    }
+  }
+  return j({ edition, items: rows, latest: await status(env), ...(previous ? { previous } : {}) });
 }
 __name(feed, "feed");
 async function article(req, env) {

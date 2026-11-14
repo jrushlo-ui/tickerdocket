@@ -126,31 +126,66 @@
     var d = new Date(v + 'T12:00:00Z');
     return isNaN(d.getTime()) ? v : d.toLocaleDateString('en-US',{month:'short',day:'2-digit',timeZone:'UTC'}).toUpperCase();
   };
+  var editionLabel = function (edition) {
+    return dateLabel(edition.local_date) + ' · ' + String(edition.kind || '').toUpperCase();
+  };
+  var checkLabel = function (value) {
+    var date = new Date(value || '');
+    if (isNaN(date.getTime())) return 'not available';
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone:'America/Chicago', month:'short', day:'numeric',
+      hour:'numeric', minute:'2-digit', timeZoneName:'short'
+    }).format(date);
+  };
   var render = function (payload) {
-    var edition = payload && payload.edition;
-    var items = payload && Array.isArray(payload.items) ? payload.items : [];
-    var latest = payload && payload.latest ? payload.latest : {};
+    var edition = payload.edition;
+    var items = payload.items;
+    var latest = payload.latest || {};
+    var previous = payload.previous;
+    var showingPrevious = !items.length && previous && previous.items.length > 0;
+    var displayed = showingPrevious ? previous.items : items;
     var board = document.querySelector('.docket-board');
     var feed = document.querySelector('#feed');
-    var label = edition ? dateLabel(edition.local_date) + ' · ' + String(edition.kind || '').toUpperCase() : 'CURRENT EDITION';
+    var label = edition ? editionLabel(edition) : 'CURRENT EDITION';
     var next = edition && edition.kind === 'morning' ? 'NEXT DOCKET / 16:30 CT' : 'NEXT DOCKET / 08:00 CT';
+    var status = '';
+    if (!edition) {
+      status = 'Awaiting the first published edition.';
+    } else if (latest.stale) {
+      status = 'The next edition is delayed.';
+    } else if (!items.length) {
+      status = edition.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
+    }
+    var previousLabel = showingPrevious ? editionLabel(previous.edition) : '';
     if (board) {
       board.innerHTML = '<div class="docket-board-head"><span>' + esc(label) + '</span><span><i class="live-dot"></i> LIVE</span></div>' +
-        (items.length ? items.slice(0,3).map(function (x) {
+        (status ? '<div class="docket-empty">' + esc(status) + '</div>' : '') +
+        (showingPrevious ? '<div class="docket-empty">PREVIOUS EDITION · ' + esc(previousLabel) + '</div>' : '') +
+        displayed.slice(0,3).map(function (x) {
           return '<a href="/story/' + encodeURIComponent(x.candidate_id || '') + '" class="docket-line"><span class="field-label">TICKER:</span><b>' + esc(x.ticker) + '</b><span class="field-label">DOCKET:</span><strong>' + esc(x.title) + '</strong></a>';
-        }).join('') : '<div class="docket-empty">No new verified findings in the current edition.</div>') +
+        }).join('') +
         '<div class="docket-board-foot">' + esc(next) + '</div>';
     }
     if (feed) {
-      feed.innerHTML = '<div class="section-intro"><div><p class="eyebrow">01 / ' + esc(edition ? String(edition.kind || '').toUpperCase() : 'CURRENT') + ' DOCKET</p><h2>' + (items.length ? 'Latest verified actions' : 'No new verified findings') + '</h2></div><span class="tag">' + esc(edition ? dateLabel(edition.local_date) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION') + '</span></div>' +
-        '<p class="market-note">' + (items.length ? 'Primary-source regulatory actions verified for this edition.' : 'Source collection is running. The next qualifying, evidence-backed company action will appear here; older findings are not relabeled as live.') + '</p>' +
-        (items.length ? '<div class="feed-grid">' + items.map(function (x) {
+      var heading = displayed.length ? 'Latest verified actions' : 'Edition status';
+      var tag = showingPrevious ? previousLabel + ' · ' + displayed.length + ' ITEMS' :
+        edition ? dateLabel(edition.local_date) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION';
+      var description = showingPrevious ? 'Showing the most recent edition with verified findings.' :
+        items.length ? 'Primary-source regulatory actions verified for this edition.' : '';
+      feed.innerHTML = '<div class="section-intro"><div><p class="eyebrow">01 / ' + esc(showingPrevious ? 'PREVIOUS DOCKET' : edition ? String(edition.kind).toUpperCase() + ' DOCKET' : 'CURRENT DOCKET') + '</p><h2>' + esc(heading) + '</h2></div><span class="tag">' + esc(tag) + '</span></div>' +
+        (status ? '<p class="market-note"><strong>' + esc(edition ? label + ' · ' : '') + esc(status) + '</strong></p>' : '') +
+        (description ? '<p class="market-note">' + esc(description) + '</p>' : '') +
+        (displayed.length ? '<div class="feed-grid">' + displayed.map(function (x) {
           return '<article class="story"><div class="docket-fields"><span>TICKER:</span><b>' + esc(x.ticker) + '</b><span>DOCKET:</span><h3>' + esc(x.title) + '</h3><span>AGENCY:</span><b>' + esc(x.agency || x.source) + '</b><span>FILED:</span><time>' + esc(x.action_date || '') + '</time></div><p>' + esc(x.impact_note || '') + '</p><a href="/story/' + encodeURIComponent(x.candidate_id || '') + '">Open verified record ↗</a></article>';
-        }).join('') + '</div>' : '<div class="feed-empty"><p>No qualifying items were published in the current edition.</p><p class="muted">Last source check: ' + esc(latest.last_successful_source_check || 'not available') + '</p></div>');
+        }).join('') + '</div>' : '') +
+        (status ? '<p class="muted">Last successful source check: ' + esc(checkLabel(latest.last_successful_source_check)) + '</p>' : '');
     }
     root.classList.remove('live-loading');
   };
-  fetch('/api/feed?live=' + Date.now(), {cache:'no-store'}).then(function (r) { return r.json(); }).then(render).catch(function () {
+  fetch('/api/feed?live=' + Date.now(), {cache:'no-store'}).then(function (r) {
+    if (!r.ok) throw new Error('Edition feed unavailable');
+    return r.json();
+  }).then(render).catch(function () {
     var board = document.querySelector('.docket-board');
     var feed = document.querySelector('#feed');
     if (board) board.innerHTML = '<div class="docket-board-head"><span>LIVE FEED</span><span>UNAVAILABLE</span></div><div class="docket-empty">Live feed temporarily unavailable.</div>';
