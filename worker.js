@@ -514,16 +514,72 @@ async function activity(env) {
 __name(activity, "activity");
 
 // src/email.js
-var MAIL = "https://api.resend.com/emails";
-var emailReady = /* @__PURE__ */ __name((env) => Boolean((env.BREVO_API_KEY || env.RESEND_API_KEY) && env.EMAIL_POSTAL_ADDRESS && env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY && env.EMAIL_LINK_SECRET), "emailReady");
-async function mail(env, to, subject, body, headers = {}) {
-  const useBrevo = Boolean(env.BREVO_API_KEY);
-  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, headers } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw Error("Email provider HTTP " + response.status + " " + String(data.message || data.code || "").slice(0, 100));
-  return data.messageId || data.id || null;
+var SES_REGION = "us-east-2";
+var SES_SENDER = "TickerDocket <briefing@tickerdocket.com>";
+var SES_PATH = "/v2/email/outbound-emails";
+var sesReady = (env) => Boolean(env.AWS_SES_ACCESS_KEY_ID && env.AWS_SES_SECRET_ACCESS_KEY);
+var emailReady = (env) => Boolean(sesReady(env) && env.EMAIL_POSTAL_ADDRESS && env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY && env.EMAIL_LINK_SECRET);
+
+function hex(bytes) {
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
-__name(mail, "mail");
+async function sesSignature(secret, date, scope, request, timestamp) {
+  const encoder = new TextEncoder();
+  const sha256 = async (value) => hex(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
+  const sign = async (key, value) => {
+    const hmac = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return crypto.subtle.sign("HMAC", hmac, encoder.encode(value));
+  };
+  let key = encoder.encode("AWS4" + secret);
+  for (const part of [date, SES_REGION, "ses", "aws4_request"]) {
+    key = await sign(key, part);
+  }
+  return hex(await sign(key, ["AWS4-HMAC-SHA256", timestamp, scope, await sha256(request)].join("\n")));
+}
+async function mail(env, to, subject, body, headers = {}) {
+  if (!sesReady(env)) throw Error("Amazon SES credentials are missing");
+  const host = "email." + SES_REGION + ".amazonaws.com";
+  const payload = JSON.stringify({
+    FromEmailAddress: SES_SENDER,
+    Destination: { ToAddresses: [to] },
+    Content: {
+      Simple: {
+        Subject: { Data: subject, Charset: "UTF-8" },
+        Body: { Html: { Data: body, Charset: "UTF-8" } },
+        Headers: Object.entries(headers).map(([Name, Value]) => ({ Name, Value }))
+      }
+    }
+  });
+  const timestamp = nowISO().replace(/[:-]|\.\d{3}/g, "");
+  const date = timestamp.slice(0, 8);
+  const scope = date + "/" + SES_REGION + "/ses/aws4_request";
+  const payloadHash = hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)));
+  const signingHeaders = {
+    "content-type": "application/json",
+    host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": timestamp
+  };
+  if (env.AWS_SES_SESSION_TOKEN) signingHeaders["x-amz-security-token"] = env.AWS_SES_SESSION_TOKEN;
+  const names = Object.keys(signingHeaders).sort();
+  const signedHeaders = names.join(";");
+  const canonicalHeaders = names.map((name) => name + ":" + signingHeaders[name] + "\n").join("");
+  const request = ["POST", SES_PATH, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const signature = await sesSignature(env.AWS_SES_SECRET_ACCESS_KEY, date, scope, request, timestamp);
+  const { host: _host, ...httpHeaders } = signingHeaders;
+  const response = await fetch("https://" + host + SES_PATH, {
+    method: "POST",
+    headers: {
+      ...httpHeaders,
+      Authorization: "AWS4-HMAC-SHA256 Credential=" + env.AWS_SES_ACCESS_KEY_ID + "/" + scope + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature
+    },
+    body: payload
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw Error("Amazon SES HTTP " + response.status + " " + String(data.message || data.Message || "").slice(0, 100));
+  if (!data.MessageId) throw Error("Amazon SES response did not include a message ID");
+  return data.MessageId;
+}
 async function validateTurnstile(env, answer, ip) {
   if (!env.TURNSTILE_SECRET || !answer) return false;
   const fd = new FormData();
