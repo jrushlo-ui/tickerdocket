@@ -807,7 +807,7 @@ async function article(req, env) {
 __name(article, "article");
 async function sitemap(env) {
   const items = (await env.DB.prepare("SELECT DISTINCT candidate_id FROM edition_items ORDER BY candidate_id LIMIT 3000").all()).results || [];
-  const urls = [base(env), ...items.map((x) => base(env) + "/story/" + encodeURIComponent(x.candidate_id))];
+  const urls = [base(env), base(env) + "/about", base(env) + "/method", ...items.map((x) => base(env) + "/story/" + encodeURIComponent(x.candidate_id))];
   return new Response('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.map((x) => `<url><loc>${html(x)}</loc></url>`).join("") + "</urlset>", { headers: { "Content-Type": "application/xml; charset=utf-8" } });
 }
 __name(sitemap, "sitemap");
@@ -910,10 +910,35 @@ async function corporate(request, env) {
   });
 }
 __name(corporate, "corporate");
+function editorialPage(title, description, body) {
+  return new Response('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' | TickerDocket</title><meta name="description" content="' + description + '"><link rel="canonical" href="https://tickerdocket.com/' + title.toLowerCase() + '"><link rel="stylesheet" href="/styles.css"></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="/">Live feed</a><a href="/about">About</a><a href="/method">Method</a></nav></header><main class="section"><p class="eyebrow">TICKERDOCKET / ' + title.toUpperCase() + '</p><h1>' + title + '</h1><div class="story" style="max-width:780px;margin-top:28px">' + body + '</div></main><footer><span>© 2026 TickerDocket</span><span>Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a></span></footer></body></html>', { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff" } });
+}
+function informationPage(path) {
+  if (path === "/about" || path === "/about/") return editorialPage("About", "Who operates TickerDocket and what the site covers.", '<h2>Independent regulatory reporting</h2><p>TickerDocket is operated by Driftless Digital Ventures, founded by Joshua Rushlo. It tracks federal regulatory actions with documented connections to publicly traded companies.</p><p>The site publishes a morning and closing docket on U.S. market days and checks its sources throughout the day. An empty edition means no new item met the publication criteria in that window; it does not mean the agencies issued no actions.</p><p>Each record links to the government action and supporting company or ticker evidence. TickerDocket is independent of the agencies it monitors and is not an investment adviser. Its coverage is informational, and regulatory exposure alone does not establish a stock price effect.</p><p>For how records are selected and updated, see <a href="/method">the method</a>.</p>');
+  return editorialPage("Method", "How TickerDocket gathers, checks, and publishes regulatory records.", '<h2>How the docket is produced</h2><p>Automated checks collect records from the Federal Register and FDA device approval and clearance sources. Source availability and publication times vary. The site checks these feeds during the day, generally every 30 minutes from 6:00 AM to 9:00 PM Central.</p><p>Candidate actions are matched to a publicly traded issuer using documented company, ownership, or ticker evidence, including company filings where applicable. A record requires an official source URL, a documented company connection, and an evidence note before it can appear in a public edition. Ambiguous matches are held for review rather than published as confirmed exposure.</p><p>Newly qualified records are captured in a morning edition at 8:00 AM Central and a closing edition at 4:30 PM Central on U.S. market days. Editions are snapshots. Later source checks can identify new candidates for a later edition, and a quiet edition may display an earlier edition with findings while clearly labeling its date.</p><p>Device approval, clearance, or a federal rule does not by itself establish financial materiality or predict a stock move. Read the linked primary record and company evidence before drawing a conclusion. See <a href="/about">who runs the site</a>.</p>');
+}
+async function adminPage(request, env) {
+  if (!env.ADMIN_TOKEN) return message(503, "Admin authentication is not configured.");
+  let credentials = "";
+  try { credentials = atob((request.headers.get("Authorization") || "").replace(/^Basic\s+/i, "")); } catch {}
+  if (credentials !== "admin:" + env.ADMIN_TOKEN) {
+    return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="TickerDocket admin", charset="UTF-8"', "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow" } });
+  }
+  const url = new URL("/admin.html", request.url);
+  const asset = await env.ASSETS.fetch(new Request(url, request));
+  const headers = new Headers(asset.headers);
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("X-Robots-Tag", "noindex, nofollow");
+  headers.set("Vary", "Authorization");
+  return new Response(asset.body, { status: asset.status, headers });
+}
 var worker_default = {
   async fetch(request, env, ctx) {
     const p = new URL(request.url).pathname;
     try {
+      if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
+      if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
+      if (p === "/robots.txt") return new Response("User-agent: *\\nAllow: /\\nDisallow: /admin\\nDisallow: /admin.html\\n\\nSitemap: https://tickerdocket.com/sitemap.xml\\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));
