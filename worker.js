@@ -1,3 +1,4 @@
+import { morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -518,7 +519,7 @@ var MAIL = "https://api.resend.com/emails";
 var emailReady = /* @__PURE__ */ __name((env) => Boolean((env.BREVO_API_KEY || env.RESEND_API_KEY) && env.EMAIL_POSTAL_ADDRESS && env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY && env.EMAIL_LINK_SECRET), "emailReady");
 async function mail(env, to, subject, body, headers = {}) {
   const useBrevo = Boolean(env.BREVO_API_KEY);
-  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, headers } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
+  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, ...(Object.keys(headers).length ? { headers } : {}), replyTo: { email: "newsletter@tickerdocket.com" } } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw Error("Email provider HTTP " + response.status + " " + String(data.message || data.code || "").slice(0, 100));
   return data.messageId || data.id || null;
@@ -597,53 +598,38 @@ async function queueMorning(env, editionId) {
  SELECT ?,id FROM subscribers WHERE status='active'`).bind(editionId).run();
 }
 __name(queueMorning, "queueMorning");
-function emailPriority(item) {
-  const text = norm((item.event_type || "") + " " + (item.title || ""));
-  let score = String(item.source).startsWith("FDA PMA") ? 90 : String(item.source).startsWith("FDA 510") ? 65 : 55;
-  if (/ORIGINAL PMA APPROVAL/.test(text)) score += 25;
-  if (/ENFORCEMENT|RECALL|COMPLAINT|PROCEEDING|REFUND|ORDER|SANCTION|INVESTIGATION/.test(text)) score += 22;
-  if (/SPECIAL CONDITIONS|AIRWORTHINESS|APPROVAL|CLEARANCE|AUTHORIZATION/.test(text)) score += 12;
-  if (/PROPOSED RULE CHANGES|DEREGISTRATION|APPLICATION/.test(text)) score -= 12;
-  if (/direct|sec-exact|sec-legal-name|federal-title-sec-issuer/i.test(item.approval_method || "")) score += 8;
-  return score;
+async function morningItems(env, editionId) {
+  const rows = (await env.DB.prepare(
+    "SELECT title,ticker,issuer,source,source_url,candidate_id,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,candidate_id LIMIT 150"
+  ).bind(editionId).all()).results || [];
+  return selectMorningItems(rows);
 }
-__name(emailPriority, "emailPriority");
-function selectEmailItems(rows, limit = 10) {
-  const perTicker = /* @__PURE__ */ new Map();
-  return [...rows].sort((a, b) => emailPriority(b) - emailPriority(a) || String(b.action_date || "").localeCompare(String(a.action_date || "")) || String(a.ticker).localeCompare(String(b.ticker))).filter((item) => {
-    const count = perTicker.get(item.ticker) || 0;
-    if (count >= 2) return false;
-    perTicker.set(item.ticker, count + 1);
-    return true;
-  }).slice(0, limit);
+async function deliverMorningBrief(env, subscriber, edition, items, test = false) {
+  const unsubscribe = await makeUnsubscribeLink(env, subscriber.subscriber_id);
+  const body = renderMorningBrief({ edition, items, unsubscribe, postalAddress: env.EMAIL_POSTAL_ADDRESS, test });
+  const headers = test ? {} : { "List-Unsubscribe": "<" + unsubscribe + ">", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" };
+  return mail(env, subscriber.email, morningSubject(edition.local_date, test), body, headers);
 }
-__name(selectEmailItems, "selectEmailItems");
 async function flushMail(env, limit = 20) {
   if (!emailReady(env)) return { sent: 0, skipped: true, reason: "Email not configured" };
-  const rows = (await env.DB.prepare(`SELECT q.id,q.edition_id,q.subscriber_id,q.attempts,s.email,s.unsubscribe_hash,
- e.local_date,e.kind FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id
- WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning'
- ORDER BY q.id ASC LIMIT ?`).bind(limit).all()).results || [];
+  const rows = (await env.DB.prepare(
+    "SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' ORDER BY q.id ASC LIMIT ?"
+  ).bind(limit).all()).results || [];
+  const editions = new Map();
   let sent = 0, failed = 0;
   for (const q of rows) {
-    const candidates = (await env.DB.prepare("SELECT i.title,i.ticker,i.source,i.source_url,i.candidate_id,i.action_date,i.event_type,c.approval_method FROM edition_items i JOIN candidates c ON c.id=i.candidate_id WHERE i.edition_id=? LIMIT 100").bind(q.edition_id).all()).results || [];
-    const items = selectEmailItems(candidates);
-    const unsub = await makeUnsubscribeLink(env, q.subscriber_id);
-    const link = base(env) + "/?utm_source=morning_email&utm_medium=email&utm_campaign=" + encodeURIComponent(q.local_date);
-    const parts = items.map((x) => `<li><strong>${html(x.ticker)}</strong> \u2014 <a href="${html(base(env) + "/story/" + encodeURIComponent(x.candidate_id))}">${html(x.title)}</a></li>`).join("");
-    const message2 = `<div style="font:16px/1.6 Arial,sans-serif;max-width:650px;margin:auto;color:#15233b"><h1>TickerDocket</h1><p><b>${html(q.local_date)} \xB7 8:00 AM Central premarket edition</b></p>${items.length ? `<p>Verified regulatory developments involving publicly traded companies:</p><ul>${parts}</ul>` : "<p>No newly verified public-company regulatory developments qualified for this edition.</p>"}<p><a href="${html(link)}">Open the full edition and supporting evidence</a></p><hr><p style="font-size:12px;color:#637">TickerDocket publishes independent research. Advertising never determines coverage. Regulatory exposure does not imply a stock-price movement.</p><p style="font-size:12px;color:#637">${html(env.EMAIL_POSTAL_ADDRESS)} \xB7 <a href="${html(unsub)}">Unsubscribe</a></p></div>`;
     try {
-      const provider = await mail(env, q.email, `TickerDocket | ${q.local_date} Morning Brief`, message2, { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" });
+      if (!editions.has(q.edition_id)) editions.set(q.edition_id, await morningItems(env, q.edition_id));
+      const provider = await deliverMorningBrief(env, q, q, editions.get(q.edition_id));
       await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,sent_at=?,provider_id=?,error=NULL WHERE id=?").bind("sent", nowISO(), nowISO(), provider, q.id).run();
       sent++;
-    } catch (e) {
-      await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,error=? WHERE id=?").bind("failed", nowISO(), err(e), q.id).run();
+    } catch (error) {
+      await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,error=? WHERE id=?").bind("failed", nowISO(), err(error), q.id).run();
       failed++;
     }
   }
   return { sent, failed, processed: rows.length };
 }
-__name(flushMail, "flushMail");
 async function mac(env, s) {
   const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.EMAIL_LINK_SECRET), "HMAC", { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const b = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(s));
@@ -807,7 +793,7 @@ async function article(req, env) {
 __name(article, "article");
 async function sitemap(env) {
   const items = (await env.DB.prepare("SELECT DISTINCT candidate_id FROM edition_items ORDER BY candidate_id LIMIT 3000").all()).results || [];
-  const urls = [base(env), ...items.map((x) => base(env) + "/story/" + encodeURIComponent(x.candidate_id))];
+  const urls = [base(env), base(env) + "/about", base(env) + "/method", ...items.map((x) => base(env) + "/story/" + encodeURIComponent(x.candidate_id))];
   return new Response('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.map((x) => `<url><loc>${html(x)}</loc></url>`).join("") + "</urlset>", { headers: { "Content-Type": "application/xml; charset=utf-8" } });
 }
 __name(sitemap, "sitemap");
@@ -910,10 +896,35 @@ async function corporate(request, env) {
   });
 }
 __name(corporate, "corporate");
+function editorialPage(title, description, body) {
+  return new Response('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' | TickerDocket</title><meta name="description" content="' + description + '"><link rel="canonical" href="https://tickerdocket.com/' + title.toLowerCase() + '"><link rel="stylesheet" href="/styles.css"></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="/">Live feed</a><a href="/about">About</a><a href="/method">Method</a></nav></header><main class="section"><p class="eyebrow">TICKERDOCKET / ' + title.toUpperCase() + '</p><h1>' + title + '</h1><div class="story" style="max-width:780px;margin-top:28px">' + body + '</div></main><footer><span>© 2026 TickerDocket</span><span>Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a></span></footer></body></html>', { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff" } });
+}
+function informationPage(path) {
+  if (path === "/about" || path === "/about/") return editorialPage("About", "Who operates TickerDocket and what the site covers.", '<h2>Independent regulatory reporting</h2><p>TickerDocket is operated by Driftless Digital Ventures, founded by Joshua Rushlo. It tracks federal regulatory actions with documented connections to publicly traded companies.</p><p>The site publishes a morning and closing docket on U.S. market days and checks its sources throughout the day. An empty edition means no new item met the publication criteria in that window; it does not mean the agencies issued no actions.</p><p>Each record links to the government action and supporting company or ticker evidence. TickerDocket is independent of the agencies it monitors and is not an investment adviser. Its coverage is informational, and regulatory exposure alone does not establish a stock price effect.</p><p>For how records are selected and updated, see <a href="/method">the method</a>.</p>');
+  return editorialPage("Method", "How TickerDocket gathers, checks, and publishes regulatory records.", '<h2>How the docket is produced</h2><p>Automated checks collect records from the Federal Register and FDA device approval and clearance sources. Source availability and publication times vary. The site checks these feeds during the day, generally every 30 minutes from 6:00 AM to 9:00 PM Central.</p><p>Candidate actions are matched to a publicly traded issuer using documented company, ownership, or ticker evidence, including company filings where applicable. A record requires an official source URL, a documented company connection, and an evidence note before it can appear in a public edition. Ambiguous matches are held for review rather than published as confirmed exposure.</p><p>Newly qualified records are captured in a morning edition at 8:00 AM Central and a closing edition at 4:30 PM Central on U.S. market days. Editions are snapshots. Later source checks can identify new candidates for a later edition, and a quiet edition may display an earlier edition with findings while clearly labeling its date.</p><p>Device approval, clearance, or a federal rule does not by itself establish financial materiality or predict a stock move. Read the linked primary record and company evidence before drawing a conclusion. See <a href="/about">who runs the site</a>.</p>');
+}
+async function adminPage(request, env) {
+  if (!env.ADMIN_TOKEN) return message(503, "Admin authentication is not configured.");
+  let credentials = "";
+  try { credentials = atob((request.headers.get("Authorization") || "").replace(/^Basic\s+/i, "")); } catch {}
+  if (credentials !== "admin:" + env.ADMIN_TOKEN) {
+    return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="TickerDocket admin", charset="UTF-8"', "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow" } });
+  }
+  const url = new URL("/admin.html", request.url);
+  const asset = await env.ASSETS.fetch(new Request(url, request));
+  const headers = new Headers(asset.headers);
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("X-Robots-Tag", "noindex, nofollow");
+  headers.set("Vary", "Authorization");
+  return new Response(asset.body, { status: asset.status, headers });
+}
 var worker_default = {
   async fetch(request, env, ctx) {
     const p = new URL(request.url).pathname;
     try {
+      if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
+      if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
+      if (p === "/robots.txt") return new Response("User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /admin.html\n\nSitemap: https://tickerdocket.com/sitemap.xml\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));
@@ -967,5 +978,5 @@ export {
   selectEditionCutoff,
   status
 };
-//# sourceMappingURL=worker.js.map
+
 

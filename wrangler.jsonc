@@ -5,7 +5,8 @@
   "compatibility_date": "2026-10-01",
   "assets": {
     "directory": "./dist",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    "run_worker_first": ["/admin", "/admin/", "/admin.html", "/about", "/about/", "/method", "/method/", "/robots.txt"]
   },
   "d1_databases": [
     {
