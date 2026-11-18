@@ -938,7 +938,7 @@ var worker_default = {
     try {
       if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
       if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
-      if (p === "/robots.txt") return new Response("User-agent: *\\nAllow: /\\nDisallow: /admin\\nDisallow: /admin.html\\n\\nSitemap: https://tickerdocket.com/sitemap.xml\\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+      if (p === "/robots.txt") return new Response("User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /admin.html\n\nSitemap: https://tickerdocket.com/sitemap.xml\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));
