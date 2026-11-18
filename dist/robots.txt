@@ -1,5 +1,6 @@
 User-agent: *
 Allow: /
+Disallow: /admin
+Disallow: /admin.html
 
-User-agent: Applebot
-Allow: /
+Sitemap: https://tickerdocket.com/sitemap.xml
