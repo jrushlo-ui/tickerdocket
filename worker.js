@@ -1,3 +1,4 @@
+import { morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -518,7 +519,7 @@ var MAIL = "https://api.resend.com/emails";
 var emailReady = /* @__PURE__ */ __name((env) => Boolean((env.BREVO_API_KEY || env.RESEND_API_KEY) && env.EMAIL_POSTAL_ADDRESS && env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY && env.EMAIL_LINK_SECRET), "emailReady");
 async function mail(env, to, subject, body, headers = {}) {
   const useBrevo = Boolean(env.BREVO_API_KEY);
-  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, headers } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
+  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, ...(Object.keys(headers).length ? { headers } : {}), replyTo: { email: "newsletter@tickerdocket.com" } } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw Error("Email provider HTTP " + response.status + " " + String(data.message || data.code || "").slice(0, 100));
   return data.messageId || data.id || null;
@@ -597,53 +598,38 @@ async function queueMorning(env, editionId) {
  SELECT ?,id FROM subscribers WHERE status='active'`).bind(editionId).run();
 }
 __name(queueMorning, "queueMorning");
-function emailPriority(item) {
-  const text = norm((item.event_type || "") + " " + (item.title || ""));
-  let score = String(item.source).startsWith("FDA PMA") ? 90 : String(item.source).startsWith("FDA 510") ? 65 : 55;
-  if (/ORIGINAL PMA APPROVAL/.test(text)) score += 25;
-  if (/ENFORCEMENT|RECALL|COMPLAINT|PROCEEDING|REFUND|ORDER|SANCTION|INVESTIGATION/.test(text)) score += 22;
-  if (/SPECIAL CONDITIONS|AIRWORTHINESS|APPROVAL|CLEARANCE|AUTHORIZATION/.test(text)) score += 12;
-  if (/PROPOSED RULE CHANGES|DEREGISTRATION|APPLICATION/.test(text)) score -= 12;
-  if (/direct|sec-exact|sec-legal-name|federal-title-sec-issuer/i.test(item.approval_method || "")) score += 8;
-  return score;
+async function morningItems(env, editionId) {
+  const rows = (await env.DB.prepare(
+    "SELECT title,ticker,issuer,source,source_url,candidate_id,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,candidate_id LIMIT 150"
+  ).bind(editionId).all()).results || [];
+  return selectMorningItems(rows);
 }
-__name(emailPriority, "emailPriority");
-function selectEmailItems(rows, limit = 10) {
-  const perTicker = /* @__PURE__ */ new Map();
-  return [...rows].sort((a, b) => emailPriority(b) - emailPriority(a) || String(b.action_date || "").localeCompare(String(a.action_date || "")) || String(a.ticker).localeCompare(String(b.ticker))).filter((item) => {
-    const count = perTicker.get(item.ticker) || 0;
-    if (count >= 2) return false;
-    perTicker.set(item.ticker, count + 1);
-    return true;
-  }).slice(0, limit);
+async function deliverMorningBrief(env, subscriber, edition, items, test = false) {
+  const unsubscribe = await makeUnsubscribeLink(env, subscriber.subscriber_id);
+  const body = renderMorningBrief({ edition, items, unsubscribe, postalAddress: env.EMAIL_POSTAL_ADDRESS, test });
+  const headers = test ? {} : { "List-Unsubscribe": "<" + unsubscribe + ">", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" };
+  return mail(env, subscriber.email, morningSubject(edition.local_date, test), body, headers);
 }
-__name(selectEmailItems, "selectEmailItems");
 async function flushMail(env, limit = 20) {
   if (!emailReady(env)) return { sent: 0, skipped: true, reason: "Email not configured" };
-  const rows = (await env.DB.prepare(`SELECT q.id,q.edition_id,q.subscriber_id,q.attempts,s.email,s.unsubscribe_hash,
- e.local_date,e.kind FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id
- WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning'
- ORDER BY q.id ASC LIMIT ?`).bind(limit).all()).results || [];
+  const rows = (await env.DB.prepare(
+    "SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' ORDER BY q.id ASC LIMIT ?"
+  ).bind(limit).all()).results || [];
+  const editions = new Map();
   let sent = 0, failed = 0;
   for (const q of rows) {
-    const candidates = (await env.DB.prepare("SELECT i.title,i.ticker,i.source,i.source_url,i.candidate_id,i.action_date,i.event_type,c.approval_method FROM edition_items i JOIN candidates c ON c.id=i.candidate_id WHERE i.edition_id=? LIMIT 100").bind(q.edition_id).all()).results || [];
-    const items = selectEmailItems(candidates);
-    const unsub = await makeUnsubscribeLink(env, q.subscriber_id);
-    const link = base(env) + "/?utm_source=morning_email&utm_medium=email&utm_campaign=" + encodeURIComponent(q.local_date);
-    const parts = items.map((x) => `<li><strong>${html(x.ticker)}</strong> \u2014 <a href="${html(base(env) + "/story/" + encodeURIComponent(x.candidate_id))}">${html(x.title)}</a></li>`).join("");
-    const message2 = `<div style="font:16px/1.6 Arial,sans-serif;max-width:650px;margin:auto;color:#15233b"><h1>TickerDocket</h1><p><b>${html(q.local_date)} \xB7 8:00 AM Central premarket edition</b></p>${items.length ? `<p>Verified regulatory developments involving publicly traded companies:</p><ul>${parts}</ul>` : "<p>No newly verified public-company regulatory developments qualified for this edition.</p>"}<p><a href="${html(link)}">Open the full edition and supporting evidence</a></p><hr><p style="font-size:12px;color:#637">TickerDocket publishes independent research. Advertising never determines coverage. Regulatory exposure does not imply a stock-price movement.</p><p style="font-size:12px;color:#637">${html(env.EMAIL_POSTAL_ADDRESS)} \xB7 <a href="${html(unsub)}">Unsubscribe</a></p></div>`;
     try {
-      const provider = await mail(env, q.email, `TickerDocket | ${q.local_date} Morning Brief`, message2, { "List-Unsubscribe": `<${unsub}>`, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" });
+      if (!editions.has(q.edition_id)) editions.set(q.edition_id, await morningItems(env, q.edition_id));
+      const provider = await deliverMorningBrief(env, q, q, editions.get(q.edition_id));
       await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,sent_at=?,provider_id=?,error=NULL WHERE id=?").bind("sent", nowISO(), nowISO(), provider, q.id).run();
       sent++;
-    } catch (e) {
-      await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,error=? WHERE id=?").bind("failed", nowISO(), err(e), q.id).run();
+    } catch (error) {
+      await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,error=? WHERE id=?").bind("failed", nowISO(), err(error), q.id).run();
       failed++;
     }
   }
   return { sent, failed, processed: rows.length };
 }
-__name(flushMail, "flushMail");
 async function mac(env, s) {
   const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.EMAIL_LINK_SECRET), "HMAC", { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const b = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(s));
@@ -992,5 +978,5 @@ export {
   selectEditionCutoff,
   status
 };
-//# sourceMappingURL=worker.js.map
+
 
