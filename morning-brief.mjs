@@ -88,7 +88,7 @@ export function renderMorningBrief({ edition, items, unsubscribe, postalAddress,
   const preheader = items.length ? items[0].title : incomplete ? 'Source checks are incomplete this morning.' : 'No new developments qualified this morning.';
   const quietTitle = incomplete ? 'Source checks are incomplete' : 'No new developments qualified this morning';
   const quietText = incomplete
-    ? 'Some official sources were unavailable when this edition was prepared. We'll continue checking throughout the trading day.'
+    ? 'Some official sources were unavailable when this edition was prepared. We will continue checking throughout the trading day.'
     : 'We checked the FDA and Federal Register for new actions with documented public-company exposure. Monitoring continues through the trading day.';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TickerDocket Morning Brief</title></head>
   <body style="margin:0;padding:0;background:#edf3f5;color:#172438;font-family:Arial,sans-serif">
