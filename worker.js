@@ -361,13 +361,19 @@ async function logRun(env, source, start, status2, count, added, error) {
 __name(logRun, "logRun");
 async function saveBatch(env, records, day, manualMap, secMap) {
   let inserted = 0;
-  for (let i = 0; i < records.length; i += 30) {
+  const usable = records.filter((item) => item && validHttps(item.source_url));
+  if (!usable.length) return 0;
+  const lookups = [];
+  for (let i = 0; i < usable.length; i += 90) {
+    const ids = usable.slice(i, i + 90).map((item) => item.id);
+    lookups.push(env.DB.prepare(`SELECT id FROM candidates WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids));
+  }
+  const found = await env.DB.batch(lookups);
+  const existingIds = new Set(found.flatMap((result) => (result.results || []).map((row) => row.id)));
+  for (let i = 0; i < usable.length; i += 120) {
     const b = [];
-    const chunk = records.slice(i, i + 30).filter((item) => item && validHttps(item.source_url));
-    const existing = chunk.length ? (await env.DB.prepare(`SELECT id FROM candidates WHERE id IN (${chunk.map(() => "?").join(",")})`).bind(...chunk.map((item) => item.id)).all()).results || [] : [];
-    const existingIds = new Set(existing.map((row) => row.id));
+    const chunk = usable.slice(i, i + 120);
     for (const item of chunk) {
-      if (!item || !validHttps(item.source_url)) continue;
       const federalMapped = String(item.source).startsWith("Federal Register") ? matchFederalIssuer(item) : null;
       const mapped = manualMap.get(norm(item.applicant)) || secMap.get(norm(item.applicant)) || federalMapped;
       const approvedFDA = !!mapped && String(item.source).startsWith("FDA") && // Subsidiary mappings need a documented issuer-to-applicant ownership link.
@@ -392,7 +398,10 @@ async function saveBatch(env, records, day, manualMap, secMap) {
    impact_note=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
    approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approval_method ELSE candidates.approval_method END,
    approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
-      if (!existingIds.has(item.id)) inserted++;
+      if (!existingIds.has(item.id)) {
+        existingIds.add(item.id);
+        inserted++;
+      }
     }
     if (b.length) await env.DB.batch(b);
   }
