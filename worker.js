@@ -519,7 +519,7 @@ var MAIL = "https://api.resend.com/emails";
 var emailReady = /* @__PURE__ */ __name((env) => Boolean((env.BREVO_API_KEY || env.RESEND_API_KEY) && env.EMAIL_POSTAL_ADDRESS && env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY && env.EMAIL_LINK_SECRET), "emailReady");
 async function mail(env, to, subject, body, headers = {}) {
   const useBrevo = Boolean(env.BREVO_API_KEY);
-  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "briefing@tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, ...(Object.keys(headers).length ? { headers } : {}), replyTo: { email: "newsletter@tickerdocket.com" } } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
+  const response = await fetch(useBrevo ? "https://api.brevo.com/v3/smtp/email" : MAIL, { method: "POST", headers: useBrevo ? { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json" } : { Authorization: "Bearer " + env.RESEND_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify(useBrevo ? { sender: { name: env.SENDER_NAME || "TickerDocket", email: env.EMAIL_FROM || "newsletter@brief.tickerdocket.com" }, to: [{ email: to }], subject, htmlContent: body, ...(Object.keys(headers).length ? { headers } : {}), replyTo: { email: "newsletter@tickerdocket.com" } } : { from: `${env.SENDER_NAME || "TickerDocket"} <${env.EMAIL_FROM || "briefing@tickerdocket.com"}`, to: [to], subject, html: body, headers }) });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw Error("Email provider HTTP " + response.status + " " + String(data.message || data.code || "").slice(0, 100));
   return data.messageId || data.id || null;
@@ -631,7 +631,7 @@ async function flushMail(env, limit = 20) {
   return { sent, failed, processed: rows.length };
 }
 async function mac(env, s) {
-  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.EMAIL_LINK_SECRET), "HMAC", { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.EMAIL_LINK_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const b = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(s));
   return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
