@@ -167,7 +167,7 @@
         '<div class="docket-board-foot">' + esc(next) + '</div>';
     }
     if (feed) {
-      var heading = displayed.length ? 'Latest verified actions' : 'Edition status';
+      var heading = displayed.length ? 'Latest verified developments' : 'Edition status';
       var tag = showingPrevious ? previousLabel + ' · ' + displayed.length + ' ITEMS' :
         edition ? dateLabel(edition.local_date) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION';
       var description = showingPrevious ? 'Showing the most recent edition with verified findings.' :
@@ -176,7 +176,8 @@
         (status ? '<p class="market-note"><strong>' + esc(edition ? label + ' · ' : '') + esc(status) + '</strong></p>' : '') +
         (description ? '<p class="market-note">' + esc(description) + '</p>' : '') +
         (displayed.length ? '<div class="feed-grid">' + displayed.map(function (x) {
-          return '<article class="story"><div class="docket-fields"><span>TICKER:</span><b>' + esc(x.ticker) + '</b><span>DOCKET:</span><h3>' + esc(x.title) + '</h3><span>AGENCY:</span><b>' + esc(x.agency || x.source) + '</b><span>FILED:</span><time>' + esc(x.action_date || '') + '</time></div><p>' + esc(x.impact_note || '') + '</p><a href="/story/' + encodeURIComponent(x.candidate_id || '') + '">Open verified record ↗</a></article>';
+          var category = x.impact_category === 'direct' ? 'Directly affects' : x.impact_category === 'possible' ? 'Could possibly affect' : '';
+          return '<article class="story">' + (category ? '<p class="eyebrow">' + esc(category) + '</p>' : '') + '<div class="docket-fields"><span>TICKER:</span><b>' + esc(x.ticker) + '</b><span>DOCKET:</span><h3>' + esc(x.title) + '</h3><span>AGENCY:</span><b>' + esc(x.agency || x.source) + '</b><span>FILED:</span><time>' + esc(x.action_date || '') + '</time></div><p>' + esc(x.impact_note || '') + '</p><a href="/story/' + encodeURIComponent(x.candidate_id || '') + '">Open verified record ↗</a></article>';
         }).join('') + '</div>' : '') +
         (status ? '<p class="muted">Last successful source check: ' + esc(checkLabel(latest.last_successful_source_check)) + '</p>' : '');
     }

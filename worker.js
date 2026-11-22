@@ -1,4 +1,5 @@
-import { morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
+import { discoverRegulatoryLeads, reviewedLaunchItems } from "./regulatory-discovery.mjs";
+import { impactCategory, morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
@@ -227,7 +228,7 @@ async function readPage(url, fetchFn) {
 }
 __name(readPage, "readPage");
 async function fetchFDAFeed(kind, now = /* @__PURE__ */ new Date(), fetchFn = fetch) {
-  const start = fdaRangeStart(now, 21), end = fdaRangeEnd(now);
+  const start = fdaRangeStart(now, 60), end = fdaRangeEnd(now);
   const api = kind === "510k" ? "https://api.fda.gov/device/510k.json" : "https://api.fda.gov/device/pma.json";
   if (!["510k", "pma"].includes(kind)) throw new Error("Unknown FDA feed");
   const results = [];
@@ -373,8 +374,10 @@ async function saveBatch(env, records, day, manualMap, secMap) {
       (!manualMap.has(norm(item.applicant)) || norm(item.applicant) === norm(mapped.issuer) || validHttps(mapped.ownership_evidence_url));
       const approvedFederal = !!federalMapped;
       const approved = approvedFDA || approvedFederal;
-      if (!approved) continue;
-      const autoExcluded = String(item.source).startsWith("Federal Register") && !federalNeedsReview(item);
+      const possibleFederal = /proposed rule|notice of proposed rulemaking/i.test(item.event_type || "") &&
+        /medicare|medicaid|reimbursement|tariff|spectrum|emission|permit|antitrust/i.test(item.title);
+      if (!approved && String(item.source).startsWith("Federal Register") && !possibleFederal && !federalNeedsReview(item)) continue;
+      const autoExcluded = String(item.source).startsWith("Federal Register") && !possibleFederal && !federalNeedsReview(item);
       const relation = mapped?.ownership_evidence_url || mapped?.issuer_evidence_url || null;
       const statement = approvedFDA ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : approvedFederal ? `Federal Register public-inspection title explicitly names an entity mapped to ${mapped.issuer} (${mapped.ticker}); the SEC issuer record supports the listed-company identity. The regulatory notice is direct company exposure, but financial materiality is not established.` : null;
       b.push(env.DB.prepare(`INSERT INTO candidates (id,source,source_url,title,agency,event_type,action_date,applicant,device_code,first_seen_local,first_seen_at,last_seen_at,status,ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
@@ -397,17 +400,53 @@ async function saveBatch(env, records, day, manualMap, secMap) {
 }
 __name(saveBatch, "saveBatch");
 async function triagePendingFederal(env) {
-  const rows = (await env.DB.prepare("SELECT id,title,agency FROM candidates WHERE status='pending' AND source='Federal Register public inspection' LIMIT 1000").all()).results || [];
-  const reject = rows.filter((row) => !federalNeedsReview(row));
+  const rows = (await env.DB.prepare("SELECT id,title,agency,event_type FROM candidates WHERE status='pending' AND source='Federal Register public inspection' LIMIT 1000").all()).results || [];
+  const reject = rows.filter((row) => !federalNeedsReview(row) &&
+    !(/proposed rule|notice of proposed rulemaking/i.test(row.event_type || "") &&
+      /medicare|medicaid|reimbursement|tariff|spectrum|emission|permit|antitrust/i.test(row.title)));
   for (let i = 0; i < reject.length; i += 50) {
     await env.DB.batch(reject.slice(i, i + 50).map((row) => env.DB.prepare("UPDATE candidates SET status='rejected',approval_method='auto-excluded-no-public-company',approved_at=? WHERE id=? AND status='pending'").bind(nowISO(), row.id)));
   }
   return { reviewed: rows.length, excluded: reject.length, retained_for_review: rows.length - reject.length };
 }
 __name(triagePendingFederal, "triagePendingFederal");
+async function scanDisclosures(env, at, day) {
+  const start = nowISO();
+  const insert = env.DB.prepare(`INSERT OR IGNORE INTO candidates
+    (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status,
+     ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  for (const item of reviewedLaunchItems) {
+    const age = Date.parse(day) - Date.parse(item.action_date);
+    if (age < 0 || age > 7 * 86400000) continue;
+    await insert.bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type,
+      item.action_date, day, start, start, "verified", item.ticker, item.issuer, item.company_evidence_url,
+      item.source_url, item.impact_note, "editor-reviewed", start).run();
+  }
+  const feeds = await discoverRegulatoryLeads(at.getTime());
+  for (const feed of feeds) {
+    let added = 0;
+    try {
+      if (feed.error) throw new Error(feed.error);
+      const discovered = feed.records.filter((item) => !reviewedLaunchItems.some((reviewed) => reviewed.source_url === item.source_url));
+      for (let i = 0; i < discovered.length; i += 30) {
+        const batch = await Promise.all(discovered.slice(i, i + 30).map(async (item) =>
+          insert.bind("lead:" + await digest(item.source_url), item.source, item.source_url, item.title, item.agency,
+            "Discovered lead", item.action_date, day, start, start, "pending", null, null, null, null, null, null, null)));
+        const saved = await env.DB.batch(batch);
+        added += saved.reduce((count, result) => count + (result.meta?.changes || 0), 0);
+      }
+      await logRun(env, feed.source, start, "ok", feed.records.length, added);
+    } catch (error) {
+      await logRun(env, feed.source, start, "error", feed.records.length, added, err(error));
+    }
+  }
+  return { sources: feeds.length, available: feeds.filter((feed) => !feed.error).length };
+}
 async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) {
   const day = localTime(at).day, results = {};
   const manualMap = await mappings(env);
+  const disclosures = source === "all" ? scanDisclosures(env, at, day).catch((error) => ({ error: err(error) })) : null;
   if (source === "all" || source === "federal") {
     const start = nowISO();
     let count = 0;
@@ -455,6 +494,7 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) 
       }
     }
   }
+  if (disclosures) results.disclosures = await disclosures;
   return results;
 }
 __name(scanSource, "scanSource");
@@ -610,17 +650,23 @@ async function deliverMorningBrief(env, subscriber, edition, items, test = false
   const headers = test ? {} : { "List-Unsubscribe": "<" + unsubscribe + ">", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" };
   return mail(env, subscriber.email, morningSubject(edition.local_date, test), body, headers);
 }
-async function flushMail(env, limit = 20) {
+async function flushMail(env, limit = 20, day = localTime().day) {
   if (!emailReady(env)) return { sent: 0, skipped: true, reason: "Email not configured" };
   const rows = (await env.DB.prepare(
-    "SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' ORDER BY q.id ASC LIMIT ?"
-  ).bind(limit).all()).results || [];
+    "SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' AND e.local_date=? ORDER BY q.id ASC LIMIT ?"
+  ).bind(day, limit).all()).results || [];
   const editions = new Map();
-  let sent = 0, failed = 0;
+  let sent = 0, failed = 0, cancelled = 0;
   for (const q of rows) {
     try {
       if (!editions.has(q.edition_id)) editions.set(q.edition_id, await morningItems(env, q.edition_id));
-      const provider = await deliverMorningBrief(env, q, q, editions.get(q.edition_id));
+      const items = editions.get(q.edition_id);
+      if (!items.length) {
+        await env.DB.prepare("UPDATE email_queue SET status='cancelled',error=? WHERE id=?").bind("No qualifying developments", q.id).run();
+        cancelled++;
+        continue;
+      }
+      const provider = await deliverMorningBrief(env, q, q, items);
       await env.DB.prepare("UPDATE email_queue SET status=?,attempts=attempts+1,last_attempt_at=?,sent_at=?,provider_id=?,error=NULL WHERE id=?").bind("sent", nowISO(), nowISO(), provider, q.id).run();
       sent++;
     } catch (error) {
@@ -628,7 +674,7 @@ async function flushMail(env, limit = 20) {
       failed++;
     }
   }
-  return { sent, failed, processed: rows.length };
+  return { sent, failed, cancelled, processed: rows.length };
 }
 async function mac(env, s) {
   const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.EMAIL_LINK_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -669,7 +715,8 @@ async function latestEdition(env, day, kind) {
 }
 __name(latestEdition, "latestEdition");
 async function editionItems(env, id) {
-  return (await env.DB.prepare("SELECT * FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,ticker ASC LIMIT 100").bind(id).all()).results || [];
+  const rows = (await env.DB.prepare("SELECT * FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,ticker ASC LIMIT 100").bind(id).all()).results || [];
+  return rows.map((item) => ({ ...item, impact_category: impactCategory(item) }));
 }
 __name(editionItems, "editionItems");
 function selectEditionCutoff(previous, now = /* @__PURE__ */ new Date()) {
@@ -681,7 +728,7 @@ async function sourceCoverage(env, at = nowISO()) {
    WHERE s.id IN (SELECT MAX(id) FROM sync_runs GROUP BY source)`).all()).results || [];
   const by = Object.fromEntries(rows.map((x) => [x.source, x]));
   const isFresh = /* @__PURE__ */ __name((x) => x && x.ended_at && Date.parse(at) - Date.parse(x.ended_at) < 75 * 6e4, "isFresh");
-  const sources = ["federal", "510k", "pma"];
+  const sources = ["federal", "510k", "pma", "FDA biologics", "FDA drugs", "FDA press-releases", "FDA recalls", "CMS newsroom", "Company releases", "SEC 8-K", "SEC 6-K"];
   return sources.every((k) => isFresh(by[k]) && by[k].status === "ok") ? "checked" : sources.some((k) => isFresh(by[k]) && ["ok", "partial"].includes(by[k].status)) ? "partial" : "incomplete";
 }
 __name(sourceCoverage, "sourceCoverage");
@@ -690,7 +737,9 @@ async function publish(env, kind, local) {
   const exists = await latestEdition(env, local.day, kind);
   if (exists) return { already_published: true, edition_id: exists.id, items: exists.qualifying_count };
   const at = nowISO();
-  const previous = await latestEdition(env);
+  const previous = kind === "morning"
+    ? await env.DB.prepare("SELECT * FROM editions WHERE kind='morning' AND local_date<? ORDER BY local_date DESC LIMIT 1").bind(local.day).first()
+    : await latestEdition(env);
   const cutoff = selectEditionCutoff(previous, new Date(at));
   const health = await sourceCoverage(env, at);
   const selected = (await env.DB.prepare(`SELECT * FROM candidates WHERE status='verified'
@@ -704,7 +753,7 @@ async function publish(env, kind, local) {
     qualified.length ? "published" : "no_new_verified_items",
     health,
     qualified.length,
-    "Immutable point-in-time snapshot of directly verified public-company developments newly discovered since previous edition. Not a trading recommendation. Source publication can lag."
+    "Snapshot of verified regulatory developments and documented public-company exposure. The morning edition covers the period since the previous morning edition."
   ).run();
   const edition = await latestEdition(env, local.day, kind);
   if (!r.meta?.changes) return { already_published: true, edition_id: edition.id };
@@ -713,7 +762,7 @@ async function publish(env, kind, local) {
    (edition_id,candidate_id,title,ticker,issuer,source,source_url,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url)
    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(edition.id, x.id, x.title, x.ticker, x.issuer, x.source, x.source_url, x.action_date, x.agency, x.event_type, x.impact_note, x.company_evidence_url, x.impact_evidence_url)));
   }
-  if (kind === "morning") await queueMorning(env, edition.id);
+  if (kind === "morning" && selectMorningItems(qualified).length) await queueMorning(env, edition.id);
   return { edition_id: edition.id, day: local.day, kind, items: qualified.length, scan_status: health, cutoff };
 }
 __name(publish, "publish");
@@ -857,7 +906,10 @@ async function admin(request, env) {
     }
     if (b.action !== "approve") return message(400, "Action must be approve/reject");
     if (!/^[A-Z]{1,7}[.\-]?[A-Z]{0,3}$/.test(b.ticker || "") || !String(b.issuer || "").trim() || !validHttps(b.company_evidence_url) || !validHttps(b.impact_evidence_url) || String(b.impact_note || "").trim().length < 55) return message(400, "Approval requires verified ticker, issuer, HTTPS issuer evidence, HTTPS direct-impact evidence, and a substantive written exposure explanation (55+ characters).");
-    await env.DB.prepare(`UPDATE candidates SET status='verified',ticker=?,issuer=?,company_evidence_url=?,impact_evidence_url=?,impact_note=?,approval_method='admin-reviewed',approved_at=? WHERE id=?`).bind(b.ticker, b.issuer, b.company_evidence_url, b.impact_evidence_url, b.impact_note, nowISO(), id).run();
+    if (b.impact_category != null && !["direct", "possible"].includes(b.impact_category)) return message(400, "Choose direct or possible impact.");
+    const eventType = b.impact_category === "direct" ? "Direct action" : b.impact_category === "possible" ? "Possible exposure" : candidate.event_type;
+    if (!impactCategory({ ...candidate, event_type: eventType })) return message(400, "Choose the impact category for this lead.");
+    await env.DB.prepare(`UPDATE candidates SET status='verified',ticker=?,issuer=?,company_evidence_url=?,impact_evidence_url=?,impact_note=?,event_type=?,approval_method='admin-reviewed',approved_at=? WHERE id=?`).bind(b.ticker, b.issuer, b.company_evidence_url, b.impact_evidence_url, b.impact_note, eventType, nowISO(), id).run();
     return j({ ok: true });
   }
   if (path === "/api/admin/news") {
@@ -969,7 +1021,7 @@ var worker_default = {
     } else if (plan.scan) {
       ctx.waitUntil(scanSource(env, "all", new Date(trigger.scheduledTime)).catch((e) => console.error("Source refresh failed", err(e))));
     }
-    if (plan.email) ctx.waitUntil(flushMail(env, 25).catch((e) => console.error("Morning email queue failed", err(e))));
+    if (plan.email) ctx.waitUntil(flushMail(env, 25, local.day).catch((e) => console.error("Morning email queue failed", err(e))));
   }
 };
 export {

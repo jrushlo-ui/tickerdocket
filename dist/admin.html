@@ -1,2 +1,107 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TickerDocket Admin</title><link rel="stylesheet" href="styles.css"></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><span class="tag">PRIVATE / ADMIN</span></header><main class="section"><p class="eyebrow">CONTROL ROOM</p><h1>Editorial operations</h1><p class="lede">A private v1 shell for source review, edition publishing, subscribers, sponsorships, and corporate reporting.</p><div class="feed-grid" style="margin-top:40px"><article class="story"><div class="story-top"><span class="agency">RESEARCH QUEUE</span><time>0 PENDING</time></div><h3>Nothing publishes without evidence.</h3><p>Review agency records, attach primary sources, and document company exposure before an item can enter an edition.</p></article><article class="story"><div class="story-top"><span class="agency blue">EDITIONS</span><time>CT</time></div><h3>08:00 / 16:30</h3><p>Premarket and closing edition slots are reserved. Automated delivery requires an approved email provider.</p></article><article class="story"><div class="story-top"><span class="agency green">CORPORATE LINK</span><time>READY TO CONNECT</time></div><h3>Driftless Digital Ventures</h3><p>Reporting contract defined for audience, revenue, subscribers, and operational status. Dashboard write endpoint not exposed in the inspected Site.</p></article></div><div class="method" style="margin-top:60px"><div><p class="eyebrow">V1 INTEGRATION NOTE</p><h2>Secure by default.</h2><p>This panel contains no credentials and makes no external write. Connect the approved dashboard endpoint and email provider in Site environment settings before enabling automation.</p></div><div class="steps"><div><b>01</b><span>Source review</span><p>Primary links and evidence notes.</p></div><div><b>02</b><span>Publish control</span><p>Human review before edition release.</p></div><div><b>03</b><span>Reporting</span><p>Aggregate metrics only to corporate dashboard.</p></div></div></div></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TickerDocket Editorial Review</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a></header>
+<main class="section">
+  <h1>Editorial review</h1>
+  <p>Confirm the company, document the business exposure, and choose an impact category before publishing a lead.</p>
+  <form id="load">
+    <label for="token">Admin token</label>
+    <input id="token" type="password" autocomplete="off" required>
+    <button type="submit">Load pending leads</button>
+  </form>
+  <p id="result" role="status"></p>
+  <ol id="leads"></ol>
+  <form id="review" hidden>
+    <h2 id="title"></h2>
+    <p><a id="source" target="_blank" rel="noopener noreferrer">Open source record</a></p>
+    <p><label>Ticker <input name="ticker" required></label></p>
+    <p><label>Public company <input name="issuer" required></label></p>
+    <p><label>Impact category <select name="impact_category" required>
+      <option value="">Choose a category</option>
+      <option value="direct">Directly affects</option>
+      <option value="possible">Could possibly affect</option>
+    </select></label></p>
+    <p><label>Company evidence URL <input name="company_evidence_url" type="url" required></label></p>
+    <p><label>Impact evidence URL <input name="impact_evidence_url" type="url" required></label></p>
+    <p><label>Business exposure and next milestone <textarea name="impact_note" rows="4" minlength="55" required></textarea></label></p>
+    <button type="submit">Approve for the next edition</button>
+    <button id="reject" type="button">Reject lead</button>
+  </form>
+</main>
+<script>
+  const load = document.querySelector('#load');
+  const token = document.querySelector('#token');
+  const result = document.querySelector('#result');
+  const list = document.querySelector('#leads');
+  const review = document.querySelector('#review');
+  let selected;
 
+  async function api(path, data) {
+    const response = await fetch('/api/admin/' + path, {
+      method: data ? 'POST' : 'GET',
+      headers: { Authorization: 'Bearer ' + token.value, 'Content-Type': 'application/json' },
+      body: data ? JSON.stringify(data) : undefined,
+      cache: 'no-store',
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Request failed.');
+    return payload;
+  }
+
+  function select(lead) {
+    selected = lead;
+    review.reset();
+    document.querySelector('#title').textContent = lead.title;
+    const source = document.querySelector('#source');
+    const url = new URL(lead.source_url);
+    if (url.protocol !== 'https:') return;
+    source.href = url.href;
+    review.hidden = false;
+    review.scrollIntoView();
+  }
+
+  async function refresh() {
+    const { candidates } = await api('queue');
+    list.replaceChildren(...candidates.map((lead) => {
+      const entry = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = lead.action_date + ' · ' + lead.source + ' · ' + lead.title;
+      button.addEventListener('click', () => select(lead));
+      entry.append(button);
+      return entry;
+    }));
+    result.textContent = candidates.length + ' pending leads displayed.';
+  }
+
+  load.addEventListener('submit', (event) => {
+    event.preventDefault();
+    refresh().catch((error) => { result.textContent = error.message; });
+  });
+
+  async function save(action, fields = {}) {
+    try {
+      await api('review', { ...fields, action, id: selected.id });
+      review.hidden = true;
+      await refresh();
+      result.textContent = action === 'approve' ? 'Approved for publication.' : 'Lead rejected.';
+    } catch (error) {
+      result.textContent = error.message;
+    }
+  }
+
+  review.addEventListener('submit', (event) => {
+    event.preventDefault();
+    save('approve', Object.fromEntries(new FormData(review)));
+  });
+  document.querySelector('#reject').addEventListener('click', () => save('reject'));
+</script>
+</body>
+</html>

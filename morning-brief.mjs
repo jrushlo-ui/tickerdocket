@@ -35,23 +35,35 @@ function marketExposure(item) {
   return Math.max(0, ...exposure);
 }
 
+export function impactCategory(item) {
+  const action = item.event_type ?? '';
+  if (/^Possible exposure$|proposed|draft|investigation|advisory committee/i.test(action)) return 'possible';
+  if (/^Direct action$|complete response letter|review extension|approval|clearance|recall|final order|final rule|suspension|revocation/i.test(action) || marketExposure(item)) return 'direct';
+  return null;
+}
+
 export function selectMorningItems(rows, limit = 10) {
-  const ranked = rows.map((item) => {
-    const fda = isFda(item);
-    return { ...item, fda, exposure: fda ? 0 : marketExposure(item) };
-  });
-  const byRecency = (a, b) => String(b.action_date ?? '').localeCompare(String(a.action_date ?? '')) ||
-    String(a.ticker).localeCompare(String(b.ticker));
-  const market = ranked.filter((item) => item.exposure > 0).sort((a, b) => b.exposure - a.exposure || byRecency(a, b));
-  const fdaPriority = (item) => /(?:original|original pma)\s+approval/i.test(item.event_type ?? '') ? 2 : /^FDA PMA\b/i.test(item.source ?? '') ? 1 : 0;
-  const fda = ranked.filter((item) => item.fda).sort((a, b) => fdaPriority(b) - fdaPriority(a) || byRecency(a, b));
+  const ranked = rows.filter((item) => item.ticker && item.issuer && item.impact_note &&
+    [item.source_url, item.company_evidence_url, item.impact_evidence_url].every(publicLink))
+    .map((item) => ({ ...item, fda: isFda(item), exposure: marketExposure(item), impact_category: impactCategory(item) }))
+    .filter((item) => item.impact_category);
+  const actionPriority = (item) => /response letter|review extension|recall/i.test(item.event_type ?? '') ? 1 : 0;
+  ranked.sort((a, b) => Number(b.impact_category === 'direct') - Number(a.impact_category === 'direct') ||
+    actionPriority(b) - actionPriority(a) ||
+    String(b.action_date ?? '').localeCompare(String(a.action_date ?? '')) ||
+    b.exposure - a.exposure ||
+    String(a.ticker).localeCompare(String(b.ticker)));
   const perTicker = new Map();
-  return [...market.slice(0, 1), ...fda, ...market.slice(1)].filter((item) => {
+  const selected = ranked.filter((item) => {
     const count = perTicker.get(item.ticker) ?? 0;
     if (count >= 2) return false;
     perTicker.set(item.ticker, count + 1);
     return true;
-  }).slice(0, limit);
+  });
+  const firstPossible = selected.find((item) => item.impact_category === 'possible');
+  const visible = selected.slice(0, limit);
+  if (limit > 1 && firstPossible && !visible.includes(firstPossible)) visible[limit - 1] = firstPossible;
+  return visible;
 }
 
 export function morningSubject(localDate, test = false) {
@@ -67,7 +79,7 @@ function evidenceLink(label, value) {
 function renderStory(item) {
   const storyUrl = `${site}/story/${encodeURIComponent(item.candidate_id)}`;
   const agency = item.fda ? 'FDA' : item.source?.startsWith('Federal Register') ? 'Federal Register' : item.agency || item.source;
-  const evidence = [evidenceLink(item.fda ? 'FDA record' : 'Official action', item.source_url),
+  const evidence = [evidenceLink(item.source === 'Issuer disclosure' ? 'Issuer disclosure' : item.fda ? 'FDA record' : 'Official record', item.source_url),
     evidenceLink('Company evidence', item.company_evidence_url)];
   if (item.impact_evidence_url !== item.company_evidence_url && item.impact_evidence_url !== item.source_url) {
     evidence.push(evidenceLink(item.exposure ? 'Financial exposure' : 'Impact evidence', item.impact_evidence_url));
@@ -83,13 +95,20 @@ function renderStory(item) {
 export function renderMorningBrief({ edition, items, unsubscribe, postalAddress, test = false }) {
   const date = dateLabel.format(new Date(`${edition.local_date}T12:00:00Z`));
   const docket = `${site}/?utm_source=morning_email&utm_medium=email&utm_campaign=${encodeURIComponent(edition.local_date)}`;
-  const headline = items[0]?.exposure > 0 ? 'Potential market mover' : `${items.length} verified ${items.length === 1 ? 'action' : 'actions'}`;
+  const headline = `${items.length} verified ${items.length === 1 ? 'development' : 'developments'}`;
+  const sections = [['direct', 'Directly affects'], ['possible', 'Could possibly affect']]
+    .map(([category, label]) => {
+      const stories = items.filter((item) => item.impact_category === category);
+      return stories.length ? '<h2 style="margin:15px 0 5px;font:bold 17px Arial,sans-serif;color:#00675e">' +
+        label + '</h2><table role="presentation" cellpadding="0" cellspacing="0" width="100%">' +
+        stories.map(renderStory).join('') + '</table>' : '';
+    }).join('');
   const incomplete = edition.scan_status !== 'checked';
   const preheader = items.length ? items[0].title : incomplete ? 'Source checks are incomplete this morning.' : 'No new developments qualified this morning.';
   const quietTitle = incomplete ? 'Source checks are incomplete' : 'No new developments qualified this morning';
   const quietText = incomplete
-    ? 'Some official sources were unavailable when this edition was prepared. We will continue checking throughout the trading day.'
-    : 'We checked the FDA and Federal Register for new actions with documented public-company exposure. Monitoring continues through the trading day.';
+    ? 'Some monitored sources were unavailable when this edition was prepared. We will continue checking throughout the trading day.'
+    : 'We checked our monitored feeds for new developments with documented public-company exposure. Monitoring continues through the trading day.';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TickerDocket Morning Brief</title></head>
   <body style="margin:0;padding:0;background:#edf3f5;color:#172438;font-family:Arial,sans-serif">
     <div style="display:none;max-height:0;overflow:hidden;mso-hide:all">${escapeHtml(preheader)}</div>
@@ -105,7 +124,7 @@ export function renderMorningBrief({ edition, items, unsubscribe, postalAddress,
       <tr><td style="padding:18px 24px 23px">
         <p style="margin:0 0 10px;color:#00675e;font:bold 11px/1.4 Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase">${escapeHtml(headline)}</p>
         ${incomplete && items.length ? '<p style="margin:0 0 12px;color:#52647a;font:13px/1.5 Arial,sans-serif">Some sources were unavailable when this edition was prepared.</p>' : ''}
-        ${items.length ? `<table role="presentation" cellpadding="0" cellspacing="0" width="100%">${items.map(renderStory).join('')}</table>` : `<div style="border-top:1px solid #dce5ea;padding:13px 0"><h2 style="margin:0 0 6px;font:bold 17px/1.3 Arial,sans-serif">${quietTitle}</h2><p style="margin:0;font:14px/1.55 Arial,sans-serif;color:#263c51">${quietText} The next website edition is scheduled for 4:30 PM Central.</p></div>`}
+        ${items.length ? sections : `<div style="border-top:1px solid #dce5ea;padding:13px 0"><h2 style="margin:0 0 6px;font:bold 17px/1.3 Arial,sans-serif">${quietTitle}</h2><p style="margin:0;font:14px/1.55 Arial,sans-serif;color:#263c51">${quietText} The next website edition is scheduled for 4:30 PM Central.</p></div>`}
         <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="background:#087567;border-radius:6px"><a href="${escapeHtml(docket)}" style="display:inline-block;padding:10px 13px;font:bold 13px/1.35 Arial,sans-serif;text-decoration:none;color:#fff">Open the full docket ?</a></td></tr></table>
       </td></tr>
       <tr><td style="padding:13px 24px;background:#eff5f6;color:#52647a;font:12px/1.5 Arial,sans-serif">
