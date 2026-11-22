@@ -925,6 +925,21 @@ var worker_default = {
       if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
       if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
       if (p === "/robots.txt") return new Response("User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /admin.html\n\nSitemap: https://tickerdocket.com/sitemap.xml\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+      if (p === "/api/private-delivery-check" && request.method === "POST") {
+        const authorization = request.headers.get("Authorization") || "";
+        const body = await request.json().catch(() => ({}));
+        const recipient = typeof body?.recipient === "string" ? body.recipient : "";
+        if (Date.now() > 1795391653244 || !/^Bearer [a-f0-9]{64}$/.test(authorization) ||
+            await digest(authorization.slice(7) + "\n" + recipient) !== "7161af8c8f9c648a52df5a49285df35b9eb6091068cf19ec35aebbb6c0b1f066") {
+          return message(404, "Unknown API endpoint");
+        }
+        if (!emailReady(env)) return message(503, "TickerDocket email is not configured.");
+        const subscriber = await env.DB.prepare("SELECT id AS subscriber_id,email FROM subscribers WHERE email=? AND status='active'").bind(recipient).first();
+        const edition = await env.DB.prepare("SELECT id,local_date,scan_status FROM editions WHERE kind='morning' ORDER BY local_date DESC LIMIT 1").first();
+        if (!subscriber || !edition) return message(404, "Active subscriber or morning edition not found.");
+        const providerId = await deliverMorningBrief(env, subscriber, edition, await morningItems(env, edition.id), true);
+        return j({ accepted: Boolean(providerId), provider_id: providerId });
+      }
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));
