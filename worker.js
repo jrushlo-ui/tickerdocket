@@ -850,9 +850,18 @@ async function article(req, env) {
 }
 __name(article, "article");
 async function sitemap(env) {
-  const items = (await env.DB.prepare("SELECT DISTINCT candidate_id FROM edition_items ORDER BY candidate_id LIMIT 3000").all()).results || [];
-  const urls = [base(env), base(env) + "/about", base(env) + "/method", ...items.map((x) => base(env) + "/story/" + encodeURIComponent(x.candidate_id))];
-  return new Response('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls.map((x) => `<url><loc>${html(x)}</loc></url>`).join("") + "</urlset>", { headers: { "Content-Type": "application/xml; charset=utf-8" } });
+  const items = (await env.DB.prepare(`SELECT i.candidate_id, MAX(e.published_at) AS edition_changed,
+    (SELECT MAX(n.verified_at) FROM related_news n WHERE n.candidate_id=i.candidate_id) AS news_changed
+    FROM edition_items i JOIN editions e ON e.id=i.edition_id
+    GROUP BY i.candidate_id ORDER BY i.candidate_id LIMIT 3000`).all()).results || [];
+  const entries = [{loc:base(env)}, {loc:base(env)+"/about"}, {loc:base(env)+"/method"},
+    ...items.filter(x => /^[A-Za-z0-9:_-]{3,100}$/.test(x.candidate_id || "")).map(x => {
+      const dates = [x.edition_changed, x.news_changed].map(v => Date.parse(v || "")).filter(v => Number.isFinite(v) && v <= Date.now());
+      return {loc:base(env)+"/story/"+encodeURIComponent(x.candidate_id), lastmod:dates.length ? new Date(Math.max(...dates)).toISOString() : null};
+    })];
+  const xml = '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' +
+    entries.map(x => `<url><loc>${html(x.loc)}</loc>${x.lastmod ? "<lastmod>"+html(x.lastmod)+"</lastmod>" : ""}</url>`).join("") + "</urlset>";
+  return new Response(xml, {headers:{"Content-Type":"application/xml; charset=utf-8","Cache-Control":"public, max-age=120"}});
 }
 __name(sitemap, "sitemap");
 async function admin(request, env) {
@@ -979,6 +988,41 @@ async function adminPage(request, env) {
   headers.set("Vary", "Authorization");
   return new Response(asset.body, { status: asset.status, headers });
 }
+async function renderHome(request, env) {
+  const asset = await env.ASSETS.fetch(request);
+  if (!asset.ok) return asset;
+  let page = await asset.text();
+  try {
+    const data = await (await feed(new Request(new URL('/api/feed', request.url), request), env)).json();
+    const edition = data.edition, items = data.items || [], previous = data.previous;
+    const showingPrevious = !items.length && previous && previous.items && previous.items.length > 0;
+    const displayed = showingPrevious ? previous.items : items;
+    const editionLabel = e => e ? String(e.local_date || "") + " · " + String(e.kind || "").toUpperCase() : "CURRENT EDITION";
+    const latest = data.latest || {};
+    let status = !edition ? "Awaiting the first published edition." : latest.stale ? "The next edition is delayed." : !items.length ? (edition.scan_status === "checked" ? "No new verified findings in this edition." : "Source checks were incomplete for this edition.") : "";
+    const board = '<aside class="docket-board" data-server-rendered="true"><div class="docket-board-head"><span>' + html(editionLabel(edition)) + '</span><span><i class="live-dot"></i> LIVE</span></div>' +
+      (status ? '<div class="docket-empty">' + html(status) + '</div>' : '') +
+      (showingPrevious ? '<div class="docket-empty">PREVIOUS EDITION · ' + html(editionLabel(previous.edition)) + '</div>' : '') +
+      displayed.slice(0,3).map(x => '<a href="/story/' + encodeURIComponent(x.candidate_id || "") + '" class="docket-line"><span class="field-label">TICKER:</span><b>' + html(x.ticker) + '</b><span class="field-label">DOCKET:</span><strong>' + html(x.title) + '</strong></a>').join("") +
+      '<div class="docket-board-foot">' + (edition && edition.kind === "morning" ? 'NEXT DOCKET / 16:30 CT' : 'NEXT DOCKET / 08:00 CT') + '</div></aside>';
+    const tag = showingPrevious ? editionLabel(previous.edition) + ' · ' + displayed.length + ' ITEMS' : edition ? editionLabel(edition) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION';
+    const feedSection = '<section id="feed" class="section" data-server-rendered="true"><div class="section-intro"><div><p class="eyebrow">01 / ' + html(showingPrevious ? "PREVIOUS DOCKET" : edition ? String(edition.kind).toUpperCase() + " DOCKET" : "CURRENT DOCKET") + '</p><h2>' + (displayed.length ? 'Latest verified developments' : 'Edition status') + '</h2></div><span class="tag">' + html(tag) + '</span></div>' +
+      (status ? '<p class="market-note"><strong>' + html(edition ? editionLabel(edition) + ' · ' : '') + html(status) + '</strong></p>' : '') +
+      (showingPrevious ? '<p class="market-note">Showing the most recent edition with verified findings.</p>' : items.length ? '<p class="market-note">Primary-source regulatory actions verified for this edition.</p>' : '') +
+      (displayed.length ? '<div class="feed-grid">' + displayed.map(x => {
+        const category = x.impact_category === "direct" ? "Directly affects" : x.impact_category === "possible" ? "Could possibly affect" : "";
+        return '<article class="story">' + (category ? '<p class="eyebrow">' + html(category) + '</p>' : '') + '<div class="docket-fields"><span>TICKER:</span><b>' + html(x.ticker) + '</b><span>DOCKET:</span><h3>' + html(x.title) + '</h3><span>AGENCY:</span><b>' + html(x.agency || x.source) + '</b><span>FILED:</span><time>' + html(x.action_date || '') + '</time></div><p>' + html(x.impact_note || '') + '</p><a href="/story/' + encodeURIComponent(x.candidate_id || '') + '">Open verified record ↗</a></article>';
+      }).join("") + '</div>' : '') + '</section>';
+    page = page.replace(/<aside class="docket-board">[\s\S]*?<\/aside>/, () => board)
+      .replace(/<section id="feed" class="section">[\s\S]*?<\/section>/, () => feedSection);
+  } catch (e) {
+    console.error("Homepage server rendering failed:", err(e));
+  }
+  const headers = new Headers(asset.headers);
+  headers.delete("Content-Length"); headers.delete("ETag"); headers.delete("Content-Encoding");
+  headers.set("Cache-Control", "no-store");
+  return new Response(page, {status:asset.status, headers});
+}
 var worker_default = {
   async fetch(request, env, ctx) {
     const p = new URL(request.url).pathname;
@@ -986,6 +1030,7 @@ var worker_default = {
       if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
       if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
       if (p === "/robots.txt") return new Response("User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /admin.html\n\nSitemap: https://tickerdocket.com/sitemap.xml\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+      if ((p === "/" || p === "/index.html") && request.method === "GET") return renderHome(request, env);
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));

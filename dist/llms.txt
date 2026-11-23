@@ -1,0 +1,10 @@
+# TickerDocket
+
+> TickerDocket covers federal regulatory actions and their documented or potential relevance to publicly traded companies. It is operated by Driftless Digital Ventures.
+
+- [Latest docket](https://tickerdocket.com/): The latest published edition and links to verified records.
+- [About](https://tickerdocket.com/about): Information about TickerDocket.
+- [Method](https://tickerdocket.com/method): How TickerDocket identifies and verifies developments.
+- [Sitemap](https://tickerdocket.com/sitemap.xml): Index of published pages and regulatory records.
+
+Records link to primary sources and describe the basis for company exposure. Potential effects are not predictions of stock performance. Regulatory information is for research and informational purposes, not investment advice.
