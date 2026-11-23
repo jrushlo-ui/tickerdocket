@@ -356,7 +356,13 @@ async function mappings(env) {
 }
 __name(mappings, "mappings");
 async function logRun(env, source, start, status2, count, added, error) {
-  await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)").bind(source, start, nowISO(), status2, count, added, error || null).run();
+  const ended = nowISO();
+  if (status2 === "ok" && added === 0 && !error) {
+    const recent = new Date(Date.parse(ended) - 35 * 60_000).toISOString();
+    await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error)\nSELECT ?,?,?,'ok',?,0,NULL\nWHERE NOT COALESCE((\n  SELECT status='ok' AND ended_at>=? FROM sync_runs WHERE source=? ORDER BY id DESC LIMIT 1\n),0)").bind(source, start, ended, count, recent, source).run();
+    return;
+  }
+  await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)").bind(source, start, ended, status2, count, added, error || null).run();
 }
 __name(logRun, "logRun");
 async function saveBatch(env, records, day, manualMap, secMap) {
