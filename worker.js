@@ -356,7 +356,13 @@ async function mappings(env) {
 }
 __name(mappings, "mappings");
 async function logRun(env, source, start, status2, count, added, error) {
-  await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)").bind(source, start, nowISO(), status2, count, added, error || null).run();
+  const ended = nowISO();
+  if (status2 === "ok" && added === 0 && !error) {
+    const recent = new Date(Date.parse(ended) - 35 * 60_000).toISOString();
+    await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error)\nSELECT ?,?,?,'ok',?,0,NULL\nWHERE NOT COALESCE((\n  SELECT status='ok' AND ended_at>=? FROM sync_runs WHERE source=? ORDER BY id DESC LIMIT 1\n),0)").bind(source, start, ended, count, recent, source).run();
+    return;
+  }
+  await env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)").bind(source, start, ended, status2, count, added, error || null).run();
 }
 __name(logRun, "logRun");
 async function saveBatch(env, records, day, manualMap, secMap) {
@@ -397,7 +403,12 @@ async function saveBatch(env, records, day, manualMap, secMap) {
    impact_evidence_url=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_evidence_url ELSE candidates.impact_evidence_url END,
    impact_note=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
    approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approval_method ELSE candidates.approval_method END,
-   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
+   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END
+   WHERE candidates.source_url IS NOT excluded.source_url
+      OR candidates.title IS NOT excluded.title
+      OR candidates.action_date IS NOT excluded.action_date
+      OR (candidates.status='pending' AND excluded.status IN ('verified','rejected'))
+      OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified')`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
       if (!existingIds.has(item.id)) {
         existingIds.add(item.id);
         inserted++;
