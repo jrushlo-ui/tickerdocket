@@ -38,7 +38,7 @@ function marketExposure(item) {
 export function impactCategory(item) {
   const action = item.event_type ?? '';
   if (/^Possible exposure$|proposed|draft|investigation|advisory committee/i.test(action)) return 'possible';
-  if (/^Direct action$|complete response letter|review extension|approval|clearance|recall|final order|final rule|suspension|revocation/i.test(action) || marketExposure(item)) return 'direct';
+  if (/^Direct action$|complete response letter|review extension|application acceptance|authorization|approval|clearance|recall|final order|final rule|suspension|revocation/i.test(action) || marketExposure(item)) return 'direct';
   return null;
 }
 
@@ -73,7 +73,7 @@ export function morningSubject(localDate, test = false) {
 
 function evidenceLink(label, value) {
   const link = publicLink(value);
-  return link ? `<a href="${escapeHtml(link)}" style="color:#00675e;font-weight:bold;text-decoration:underline">${label} ?</a>` : '';
+  return link ? `<a href="${escapeHtml(link)}" style="color:#00675e;font-weight:bold;text-decoration:underline">${label} ↗</a>` : '';
 }
 
 function renderStory(item) {
@@ -125,7 +125,7 @@ export function renderMorningBrief({ edition, items, unsubscribe, postalAddress,
         <p style="margin:0 0 10px;color:#00675e;font:bold 11px/1.4 Consolas,monospace;letter-spacing:0.08em;text-transform:uppercase">${escapeHtml(headline)}</p>
         ${incomplete && items.length ? '<p style="margin:0 0 12px;color:#52647a;font:13px/1.5 Arial,sans-serif">Some sources were unavailable when this edition was prepared.</p>' : ''}
         ${items.length ? sections : `<div style="border-top:1px solid #dce5ea;padding:13px 0"><h2 style="margin:0 0 6px;font:bold 17px/1.3 Arial,sans-serif">${quietTitle}</h2><p style="margin:0;font:14px/1.55 Arial,sans-serif;color:#263c51">${quietText} The next website edition is scheduled for 4:30 PM Central.</p></div>`}
-        <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="background:#087567;border-radius:6px"><a href="${escapeHtml(docket)}" style="display:inline-block;padding:10px 13px;font:bold 13px/1.35 Arial,sans-serif;text-decoration:none;color:#fff">Open the full docket ?</a></td></tr></table>
+        <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="background:#087567;border-radius:6px"><a href="${escapeHtml(docket)}" style="display:inline-block;padding:10px 13px;font:bold 13px/1.35 Arial,sans-serif;text-decoration:none;color:#fff">Open the full docket ↗</a></td></tr></table>
       </td></tr>
       <tr><td style="padding:13px 24px;background:#eff5f6;color:#52647a;font:12px/1.5 Arial,sans-serif">
         <p style="margin:0 0 4px">Regulatory exposure alone doesn't establish a stock-price reaction.</p>

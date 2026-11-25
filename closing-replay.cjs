@@ -2,16 +2,11 @@
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const { DatabaseSync } = require('node:sqlite');
 const path = require('node:path');
 const evidence = path.resolve(process.argv[2] || '../audit/evidence');
 const read = name => JSON.parse(fs.readFileSync(path.join(evidence, name), 'utf8'));
 const fixedAt = '2026-11-24T22:30:14.716Z';
-const db = new DatabaseSync(':memory:');
-db.exec(`CREATE TABLE editions(id INTEGER PRIMARY KEY,local_date TEXT,kind TEXT,published_at TEXT,status TEXT,scan_status TEXT,qualifying_count INTEGER,notes TEXT,UNIQUE(local_date,kind));
-CREATE TABLE sync_runs(id INTEGER PRIMARY KEY,source TEXT,started_at TEXT,ended_at TEXT,status TEXT,seen_count INTEGER,inserted_count INTEGER,error TEXT);
-CREATE TABLE candidates(id TEXT PRIMARY KEY,source TEXT,source_url TEXT,title TEXT,agency TEXT,event_type TEXT,action_date TEXT,applicant TEXT,device_code TEXT,first_seen_local TEXT,first_seen_at TEXT,last_seen_at TEXT,status TEXT,ticker TEXT,issuer TEXT,company_evidence_url TEXT,impact_evidence_url TEXT,impact_note TEXT,approval_method TEXT,approved_at TEXT);
-CREATE TABLE edition_items(edition_id INTEGER,candidate_id TEXT,title TEXT,ticker TEXT,issuer TEXT,source TEXT,source_url TEXT,action_date TEXT,agency TEXT,event_type TEXT,impact_note TEXT,company_evidence_url TEXT,impact_evidence_url TEXT,PRIMARY KEY(edition_id,candidate_id));`);
+const {DB,db}=require('./test-d1.cjs').editorialD1();
 function add(table, row) {
   const keys = Object.keys(row);
   db.prepare(`INSERT INTO ${table} (${keys.join(',')}) VALUES (${keys.map(()=>'?').join(',')})`).run(...Object.values(row));
@@ -24,10 +19,6 @@ for (const c of read('candidates.json')) {
   const {url,...row}=c;
   add('candidates',{...row,source_url:url});
 }
-function statement(sql,args=[]) {
-  return {bind(...values){return statement(sql,values);},async all(){return {results:db.prepare(sql).all(...args)};},async first(){return db.prepare(sql).get(...args)||null;},async run(){const r=db.prepare(sql).run(...args);return {meta:{changes:Number(r.changes),last_row_id:Number(r.lastInsertRowid)}};}};
-}
-const DB={prepare:statement,async batch(statements){return Promise.all(statements.map(x=>x.run()));}};
 const context = vm.createContext({console,URL,Response,Headers,FormData,TextEncoder,AbortSignal,crypto,Date,Map,Set,Intl,
   fetch(){throw Error('Network forbidden in historical replay');},setTimeout,clearTimeout});
 vm.runInContext(fs.readFileSync(process.env.TD_FIXED_BUNDLE || path.join(evidence,'production-worker.mjs'),'utf8').replace(/export\s*\{[\s\S]*$/,''),context);

@@ -1,4 +1,8 @@
-import { describeCoverage, editionOutcome, editionNotice } from "./edition-health.mjs";
+import homeTemplate from "./dist/index.html";
+import adminTemplate from "./dist/admin.html";
+import { ensurePipeline,recordDiscovery,saveCheckpoint } from "./pipeline-store.mjs";
+import { reviewPending } from "./review-queue.mjs";
+import { EXPECTED_SOURCES,describeCoverage, editionOutcome, editionNotice } from "./edition-health.mjs";
 import { evidenceFetcher } from "./source-evidence.mjs";
 import { discoverRegulatoryLeads, reviewedLaunchItems } from "./regulatory-discovery.mjs";
 import { impactCategory, morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
@@ -250,7 +254,9 @@ async function fetchFDAFeed(kind, now = /* @__PURE__ */ new Date(), fetchFn = fe
     if (data.results.length < limit) break;
   }
   if (total > results.length) throw new Error(`FDA ${kind} result window contains ${total} rows, but scan cap is ${results.length}; reduce lookback or enable pagination`);
-  return { kind, count: results.length, updated_at: metaDate, decisions: results.map((r) => normalizeFDADecision(r, kind)).filter(Boolean) };
+  return { kind, count: results.length, updated_at: metaDate, decisions: results.map((r) => normalizeFDADecision(r, kind)).filter(Boolean),
+    dispositions: results.map(r=>[r.k_number || r.pma_number || null,r.supplement_number || null,r.decision_code || null,
+      normalizeFDADecision(r,kind) ? 'qualifying decision' : 'decision code, applicant, date or identifier did not qualify']) };
 }
 __name(fetchFDAFeed, "fetchFDAFeed");
 
@@ -368,10 +374,10 @@ async function saveBatch(env, records, day, manualMap, secMap) {
   const lookups = [];
   for (let i = 0; i < usable.length; i += 90) {
     const ids = usable.slice(i, i + 90).map((item) => item.id);
-    lookups.push(env.DB.prepare(`SELECT id FROM candidates WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids));
+    lookups.push(env.DB.prepare(`SELECT id,status,approval_method,title,source_url,action_date FROM candidates WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids));
   }
   const found = await env.DB.batch(lookups);
-  const existingIds = new Set(found.flatMap((result) => (result.results || []).map((row) => row.id)));
+  const existing = new Map(found.flatMap(result=>(result.results||[]).map(row=>[row.id,row])));
   for (let i = 0; i < usable.length; i += 120) {
     const b = [];
     const chunk = usable.slice(i, i + 120);
@@ -386,6 +392,10 @@ async function saveBatch(env, records, day, manualMap, secMap) {
         /medicare|medicaid|reimbursement|tariff|spectrum|emission|permit|antitrust/i.test(item.title);
       if (!approved && String(item.source).startsWith("Federal Register") && !possibleFederal && !federalNeedsReview(item)) continue;
       const autoExcluded = String(item.source).startsWith("Federal Register") && !possibleFederal && !federalNeedsReview(item);
+      const prior = existing.get(item.id);
+      const canPromote = prior && (prior.status==='pending' && (approved || autoExcluded) ||
+        prior.status==='rejected' && prior.approval_method?.startsWith('auto-excluded-') && approved);
+      if (prior && !canPromote && prior.title===item.title && prior.source_url===item.source_url && prior.action_date===item.action_date) continue;
       const relation = mapped?.ownership_evidence_url || mapped?.issuer_evidence_url || null;
       const statement = approvedFDA ? `FDA record names ${item.applicant} as applicant. ${mapped.issuer} (${mapped.ticker}) is linked through the documented applicant/issuer identity or ownership evidence. This is direct device-regulatory exposure; commercial materiality is unknown.` : approvedFederal ? `Federal Register public-inspection title explicitly names an entity mapped to ${mapped.issuer} (${mapped.ticker}); the SEC issuer record supports the listed-company identity. The regulatory notice is direct company exposure, but financial materiality is not established.` : null;
       b.push(env.DB.prepare(`INSERT INTO candidates (id,source,source_url,title,agency,event_type,action_date,applicant,device_code,first_seen_local,first_seen_at,last_seen_at,status,ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
@@ -405,8 +415,8 @@ async function saveBatch(env, records, day, manualMap, secMap) {
       OR candidates.action_date IS NOT excluded.action_date
       OR (candidates.status='pending' AND excluded.status IN ('verified','rejected'))
       OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified')`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
-      if (!existingIds.has(item.id)) {
-        existingIds.add(item.id);
+      if (!prior) {
+        existing.set(item.id,item);
         inserted++;
       }
     }
@@ -427,17 +437,14 @@ async function triagePendingFederal(env) {
 }
 __name(triagePendingFederal, "triagePendingFederal");
 async function scanDisclosures(env, at, day, fetcher = fetch) {
+  await ensurePipeline(env.DB);
   const start = nowISO();
-  const insert = env.DB.prepare(`INSERT OR IGNORE INTO candidates
-    (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status,
-     ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const reviewedInsert = env.DB.prepare(`INSERT INTO candidates
     (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status,
      ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET title=excluded.title,event_type=excluded.event_type,
-      status=excluded.status,ticker=excluded.ticker,issuer=excluded.issuer,
+      agency=excluded.agency,status=excluded.status,ticker=excluded.ticker,issuer=excluded.issuer,
       company_evidence_url=excluded.company_evidence_url,impact_evidence_url=excluded.impact_evidence_url,
       impact_note=excluded.impact_note,approval_method=excluded.approval_method,approved_at=excluded.approved_at
     WHERE candidates.status='pending'`);
@@ -450,20 +457,33 @@ async function scanDisclosures(env, at, day, fetcher = fetch) {
       item.impact_evidence_url || item.source_url, item.impact_note, "editor-reviewed", start));
   }
   if (reviewedStatements.length) await env.DB.batch(reviewedStatements);
-  const feeds = await discoverRegulatoryLeads(at.getTime(), fetcher);
+  const stored = (await env.DB.prepare("SELECT key,value FROM pipeline_state WHERE key LIKE 'SEC %'").all()).results || [];
+  const states = Object.fromEntries(stored.map(row => [row.key,JSON.parse(row.value)]));
+  const feeds = await discoverRegulatoryLeads(at.getTime(), fetcher, states);
   for (const feed of feeds) {
     let added = 0;
     try {
-      if (feed.error) throw new Error(feed.error);
-      const discovered = feed.records.filter((item) => !reviewedLaunchItems.some((reviewed) => reviewed.source_url === item.source_url));
-      for (let i = 0; i < discovered.length; i += 30) {
-        const batch = await Promise.all(discovered.slice(i, i + 30).map(async (item) =>
-          insert.bind("lead:" + await digest(item.source_url), item.source, item.source_url, item.title, item.agency,
-            "Discovered lead", item.action_date, day, start, start, "pending", null, null, null, null, null, null, null)));
-        const saved = await env.DB.batch(batch);
-        added += saved.reduce((count, result) => count + (result.meta?.changes || 0), 0);
+      const writes = [];
+      const rows = await Promise.all(feed.records.map(async item => ({
+        ...item,id:'lead:'+await digest(item.source_url),
+      })));
+      for (let i=0;i<rows.length;i+=150) {
+        const saved = await env.DB.prepare(`INSERT OR IGNORE INTO candidates
+          (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status)
+          SELECT value->>'id',value->>'source',value->>'source_url',value->>'title',value->>'agency','Discovered lead',
+          value->>'action_date',?,?,?,'pending' FROM json_each(?)`)
+          .bind(day,start,start,JSON.stringify(rows.slice(i,i+150).filter(item=>!reviewedLaunchItems.some(r=>r.source_url===item.source_url)))).run();
+        added += saved.meta?.changes || 0;
       }
-      await logRun(env, feed.source, start, feed.coverage_error ? "partial" : "ok", feed.records.length, added, feed.coverage_error);
+      const dispositions = {};
+      for (const [, ,reason] of feed.decisions) dispositions[reason]=(dispositions[reason]||0)+1;
+      writes.push(recordDiscovery(env.DB,feed.source,start,{endpoints:feed.attempts,pages:feed.pages,
+        raw_entries:feed.decisions.length,accepted:rows.length,dispositions,entries:feed.decisions,
+        coverage_error:feed.error || feed.coverage_error || null}));
+      if (feed.next) writes.push(saveCheckpoint(env.DB,feed.source,feed.next));
+      writes.push(env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)")
+        .bind(feed.source,start,nowISO(),feed.error ? "error" : feed.coverage_error ? "partial" : "ok",rows.length,added,feed.error || feed.coverage_error || null));
+      await env.DB.batch(writes);
     } catch (error) {
       await logRun(env, feed.source, start, "error", feed.records.length, added, err(error));
     }
@@ -471,8 +491,16 @@ async function scanDisclosures(env, at, day, fetcher = fetch) {
   return { sources: feeds.length, available: feeds.filter((feed) => !feed.error).length };
 }
 async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), capture = false) {
+  await ensurePipeline(env.DB);
   const evidence = capture ? evidenceFetcher(at) : null;
-  const fetcher = evidence?.fetch || fetch;
+  const upstream = evidence?.fetch || fetch;
+  let reference;
+  const fetcher = async (url,options) => {
+    if (String(url) !== SEC) return upstream(url,options);
+    reference ||= upstream(url,options).then(async r=>({body:await r.text(),status:r.status}));
+    const result=await reference;
+    return new Response(result.body,{status:result.status,headers:{'Content-Type':'application/json'}});
+  };
   const day = localTime(at).day, results = {};
   const manualMap = await mappings(env);
   const disclosures = source === "all" ? scanDisclosures(env, at, day, fetcher).catch((error) => ({ error: err(error) })) : null;
@@ -483,11 +511,17 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
       const r = await fetcher(REGISTER, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(23e3) });
       const data = await readJSON(r);
       if (!Array.isArray(data.results)) throw Error("Invalid Federal Register schema");
-      const rows = data.results.slice(0, 500).map(fdDoc).filter(Boolean);
+      const rows = data.results.map(fdDoc).filter(Boolean);
       count = rows.length;
       const added = await saveBatch(env, rows, day, manualMap, /* @__PURE__ */ new Map());
       const triage = await triagePendingFederal(env);
-      await logRun(env, "federal", start, "ok", count, added);
+      const invalid = data.results.length-count;
+      await recordDiscovery(env.DB,'federal',start,{raw_entries:data.results.length,invalid,entries:data.results.map(doc=>{
+        const row=fdDoc(doc);
+        return [doc.document_number || null,!row ? 'invalid document number' : matchFederalIssuer(row) ? 'named issuer' :
+          federalNeedsReview(row) || /proposed rule/i.test(row.event_type) && /medicare|medicaid|reimbursement|tariff|spectrum|emission|permit|antitrust/i.test(row.title) ? 'candidate' : 'no identified issuer or relevant proposal'];
+      })}).run();
+      await logRun(env, "federal", start, invalid ? "partial" : "ok", count, added,invalid ? invalid+' malformed records' : null);
       results.federal = { ok: true, count, inserted: added, triage };
     } catch (e) {
       await logRun(env, "federal", start, "error", count, 0, err(e));
@@ -514,6 +548,7 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
           device_code: d.product_code
         }));
         const added = await saveBatch(env, rows, day, manualMap, sec);
+        await recordDiscovery(env.DB,kind,start,{raw_entries:feed2.count,accepted:count,entries:feed2.dispositions}).run();
         const secError = sec.verification_error || null;
         await logRun(env, kind, start, secError ? "partial" : "ok", count, added, secError);
         results[kind] = { ok: !secError, count, saved: added, fda_data_updated_at: feed2.updated_at, issuer_verified: !secError, error: secError };
@@ -524,6 +559,10 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
     }
   }
   if (disclosures) results.disclosures = await disclosures;
+  if (source==='all') {
+    try { results.review=await reviewPending(env.DB,new Date(),fetcher,5); }
+    catch(error) { results.review={error:err(error)}; await logRun(env,'document review',nowISO(),'error',0,0,err(error)); }
+  }
   if (evidence) {
     try { results.evidence = await evidence.save(env.DB); }
     catch (error) { results.evidence = {error:err(error)}; await logRun(env, "source evidence", nowISO(), "error", 0, 0, err(error)); }
@@ -533,6 +572,48 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
 __name(scanSource, "scanSource");
 
 // src/activity.js
+async function collectionHealth(env) {
+  const at=nowISO(),DB=env.DB;
+  const coverage=await sourceCoverageDetails(env,at);
+  const table=await DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='review_attempts'").first();
+  let operations=[],review=[],capture=null,logs=[];
+  if (table) {
+    const result=await DB.batch([
+      DB.prepare(`SELECT source,started_at,json_extract(details,'$.raw_entries') raw_entries,
+        json_extract(details,'$.pages') pages,json_extract(details,'$.accepted') accepted,
+        json_extract(details,'$.coverage_error') error,json_extract(details,'$.endpoints') endpoints FROM discovery_checks
+        WHERE id IN (SELECT MAX(id) FROM discovery_checks GROUP BY source)`),
+      DB.prepare(`SELECT CASE WHEN c.status='pending' THEN COALESCE(a.outcome,'awaiting_review') ELSE a.outcome END outcome,
+        COUNT(*) count FROM candidates c LEFT JOIN review_attempts a ON a.candidate_id=c.id
+        WHERE c.status='pending' OR a.outcome IS NOT NULL GROUP BY 1`),
+      DB.prepare("SELECT source,status,ended_at,error FROM sync_runs WHERE source IN ('document review','source evidence','pipeline service','edition publication') ORDER BY id DESC LIMIT 6"),
+      DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='source_snapshots'"),
+    ]);
+    operations=result[0].results||[];review=result[1].results||[];logs=result[2].results||[];
+    if (result[3].results?.length) capture=await DB.prepare(`SELECT scan_id,MAX(scheduled_at) scheduled_at,COUNT(*) requests,
+      SUM(CASE WHEN capture_error IS NOT NULL THEN 1 ELSE 0 END) capture_gaps FROM source_snapshots
+      WHERE scan_id=(SELECT scan_id FROM source_snapshots ORDER BY id DESC LIMIT 1) GROUP BY scan_id`).first();
+  }
+  return {as_of:at,expected:EXPECTED_SOURCES.length,coverage:coverage.status,checks:coverage.checks.map(check=>{
+    const op=operations.find(x=>x.source===check.source);
+    return {...check,raw_entries:op?.raw_entries??null,pages:op?.pages??null,accepted:op?.accepted??null,
+      endpoint_attempts:op?.endpoints ? JSON.parse(op.endpoints) : []};
+  }),reviews:review,latest_evidence:capture,operations:logs,within_monitoring_hours:expectsFreshSourceCheck(localTime())};
+}
+async function coveragePage(env) {
+  const data=await collectionHealth(env);
+  const ct=v=> v ? new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(new Date(v)) : 'Awaiting first check';
+  const names=x=>x==='Company releases'?'GlobeNewswire Biotechnology':x==='federal'?'Federal Register public inspection':x==='510k'?'FDA 510(k)':x==='pma'?'FDA PMA':x;
+  const rows=data.checks.map(c=>'<tr><th scope="row">'+html(names(c.source))+'</th><td>'+html(c.status)+'</td><td>'+html(ct(c.ended_at))+'</td><td>'+html(c.error || '—')+'</td></tr>').join('');
+  const pending=data.reviews.filter(x=>['awaiting_review','editor_review','retry'].includes(x.outcome));
+  const labels={awaiting_review:'Awaiting review',editor_review:'Needs an editor',retry:'Scheduled for another attempt'};
+  const counts=pending.map(x=>'<li>'+html(labels[x.outcome])+': '+Number(x.count)+'</li>').join('');
+  return editorialPage('Source coverage','Collection results and review status for the monitored sources.',
+    '<h2>Latest checks</h2><p>'+data.expected+' monitored sources. Times are Central. Scheduled collection runs every half hour from 6:00 a.m. to 9:00 p.m., with additional checks before editions.</p>'+
+    '<div style="overflow-x:auto"><table><thead><tr><th>Source</th><th>Result</th><th>Last check</th><th>Detail</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+    (counts?'<h2>Review queue</h2><ul>'+counts+'</ul>':'')+
+    (data.latest_evidence?'<p>Last saved source evidence: '+html(ct(data.latest_evidence.scheduled_at))+' · '+Number(data.latest_evidence.requests)+' requests · '+Number(data.latest_evidence.capture_gaps)+' capture gaps.</p>':''));
+}
 async function activity(env) {
   const runs = (await env.DB.prepare(`SELECT source,started_at,ended_at,status,seen_count,inserted_count,error
     FROM sync_runs WHERE id IN (SELECT MAX(id) FROM sync_runs GROUP BY source) ORDER BY source`).all()).results || [];
@@ -568,7 +649,8 @@ async function activity(env) {
   const last = runs.filter((x) => x.ended_at).map((x) => Date.parse(x.ended_at)).filter(Number.isFinite);
   const lastScan = last.length ? new Date(Math.max(...last)).toISOString() : null;
   const refreshWindowActive = expectsFreshSourceCheck(localTime());
-  const healthy = runs.length >= 3 && runs.every((x) => x.status === "ok" && x.ended_at && (!refreshWindowActive || Date.now() - Date.parse(x.ended_at) < 75 * 6e4));
+  const checks = describeCoverage(runs,nowISO()).checks;
+  const healthy = checks.every(x=>x.status==='ok' || !refreshWindowActive && x.status==='stale' && runs.find(r=>r.source===x.source)?.status==='ok');
   return {
     as_of: nowISO(),
     last_scan_at: lastScan,
@@ -580,6 +662,8 @@ async function activity(env) {
     new_since_edition: newFindings,
     pending_by_source: pendingBySource,
     source_checks: runs,
+    expected_source_count: EXPECTED_SOURCES.length,
+    coverage: checks,
     counts: { collected: totals?.total || 0, verified: totals?.verified || 0, pending_review: totals?.pending || 0, automatically_excluded: totals?.excluded || 0 },
     verified_findings: items,
     note: "New verified records appear between half-hour scans without rewriting immutable editions. Verified research records are not an edition. FDA data publication may lag its underlying decision date; stock-price effects are not established."
@@ -673,7 +757,7 @@ async function queueMorning(env, editionId) {
 __name(queueMorning, "queueMorning");
 async function morningItems(env, editionId) {
   const rows = (await env.DB.prepare(
-    "SELECT title,ticker,issuer,source,source_url,candidate_id,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,candidate_id LIMIT 150"
+    "SELECT title,ticker,issuer,source,source_url,candidate_id,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,candidate_id"
   ).bind(editionId).all()).results || [];
   return selectMorningItems(rows);
 }
@@ -748,7 +832,7 @@ async function latestEdition(env, day, kind) {
 }
 __name(latestEdition, "latestEdition");
 async function editionItems(env, id) {
-  const rows = (await env.DB.prepare("SELECT * FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,ticker ASC LIMIT 100").bind(id).all()).results || [];
+  const rows = (await env.DB.prepare("SELECT * FROM edition_items WHERE edition_id=? ORDER BY action_date DESC,ticker ASC,candidate_id").bind(id).all()).results || [];
   return rows.map((item) => ({ ...item, impact_category: impactCategory(item) }));
 }
 __name(editionItems, "editionItems");
@@ -777,39 +861,39 @@ async function publish(env, kind, local, scanResult = null) {
   const cutoff = selectEditionCutoff(previous, new Date(at));
   const coverage = await sourceCoverageDetails(env, at);
   const health = coverage.status;
-  const pending = await env.DB.prepare("SELECT COUNT(*) n FROM candidates WHERE status='pending' AND first_seen_at <= ?").bind(at).first();
+  const pending = await env.DB.prepare("SELECT COUNT(*) n,COALESCE(SUM(first_seen_at>?),0) recent FROM candidates WHERE status='pending' AND first_seen_at <= ?").bind(cutoff,at).first();
   const pendingCount = pending?.n || 0;
   const selected = (await env.DB.prepare(`SELECT * FROM candidates WHERE status='verified'
    AND first_seen_at <= ? AND (approved_at IS NULL OR approved_at <= ?)
    AND (first_seen_at > ? OR approved_at > ?)
-   ORDER BY COALESCE(approved_at,first_seen_at) DESC,id ASC LIMIT 150`).bind(at, at, cutoff, cutoff).all()).results || [];
+   ORDER BY COALESCE(approved_at,first_seen_at) DESC,id ASC`).bind(at, at, cutoff, cutoff).all()).results || [];
   const qualified = selected.filter(verifyPublicStory);
-  const r = await env.DB.prepare("INSERT OR IGNORE INTO editions(local_date,kind,published_at,status,scan_status,qualifying_count,notes) VALUES(?,?,?,?,?,?,?)").bind(
-    local.day,
-    kind,
-    at,
-    editionOutcome(qualified.length, health, pendingCount),
-    health,
-    qualified.length,
-    JSON.stringify({summary:"Snapshot of verified regulatory developments and documented public-company exposure.", cutoff, source_coverage:coverage, pending_review_count:pendingCount, source_evidence:scanResult?.evidence || {status:"not_captured"}})
-  ).run();
-  const edition = await latestEdition(env, local.day, kind);
-  if (!r.meta?.changes) return { already_published: true, edition_id: edition.id };
-  for (let i = 0; i < qualified.length; i += 30) {
-    await env.DB.batch(qualified.slice(i, i + 30).map((x) => env.DB.prepare(`INSERT OR IGNORE INTO edition_items
-   (edition_id,candidate_id,title,ticker,issuer,source,source_url,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url)
-   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(edition.id, x.id, x.title, x.ticker, x.issuer, x.source, x.source_url, x.action_date, x.agency, x.event_type, x.impact_note, x.company_evidence_url, x.impact_evidence_url)));
+  const publicationId=crypto.randomUUID();
+  const notes=JSON.stringify({summary:"Verified regulatory developments and documented public-company exposure.",cutoff,
+    source_coverage:coverage,pending_review_count:pendingCount,window_pending_count:pending?.recent || 0,source_evidence:scanResult?.evidence || {status:"not_captured"},
+    review:scanResult?.review || null,publication_id:publicationId});
+  const writes=[env.DB.prepare("INSERT OR IGNORE INTO editions(local_date,kind,published_at,status,scan_status,qualifying_count,notes) VALUES(?,?,?,?,?,?,?)")
+    .bind(local.day,kind,at,editionOutcome(qualified.length,health,pending?.recent || 0),health,qualified.length,notes)];
+  for (let i=0;i<qualified.length;i+=40) {
+    writes.push(env.DB.prepare(`INSERT INTO edition_items
+      (edition_id,candidate_id,title,ticker,issuer,source,source_url,action_date,agency,event_type,impact_note,company_evidence_url,impact_evidence_url)
+      SELECT e.id,j.value->>'id',j.value->>'title',j.value->>'ticker',j.value->>'issuer',j.value->>'source',j.value->>'source_url',
+        j.value->>'action_date',j.value->>'agency',j.value->>'event_type',j.value->>'impact_note',j.value->>'company_evidence_url',j.value->>'impact_evidence_url'
+      FROM editions e,json_each(?) j WHERE e.local_date=? AND e.kind=? AND json_extract(e.notes,'$.publication_id')=?`)
+      .bind(JSON.stringify(qualified.slice(i,i+40)),local.day,kind,publicationId));
   }
-  if (kind === "morning" && selectMorningItems(qualified).length) await queueMorning(env, edition.id);
+  if (kind==="morning" && selectMorningItems(qualified).length) {
+    writes.push(env.DB.prepare(`INSERT OR IGNORE INTO email_queue(edition_id,subscriber_id)
+      SELECT e.id,s.id FROM editions e,subscribers s WHERE e.local_date=? AND e.kind=? AND s.status='active'
+      AND json_extract(e.notes,'$.publication_id')=?`).bind(local.day,kind,publicationId));
+  }
+  const saved=await env.DB.batch(writes);
+  const edition=await latestEdition(env,local.day,kind);
+  if (!saved[0].meta?.changes) return {already_published:true,edition_id:edition.id,items:edition.qualifying_count};
   return { edition_id: edition.id, day: local.day, kind, items: qualified.length, scan_status: health, cutoff };
 }
 __name(publish, "publish");
-async function status(env) {
-  const last = (await env.DB.prepare("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 8").all()).results || [];
-  const edition = await latestEdition(env);
-  const subscribers = await env.DB.prepare("SELECT COUNT(*) count FROM subscribers WHERE status='active'").first();
-  const queued = await env.DB.prepare("SELECT COUNT(*) count FROM email_queue WHERE status IN ('queued','failed')").first();
-  const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
+function editionTiming(edition) {
   const at = edition?.published_at ? new Date(edition.published_at).getTime() : null;
   const ageHours = at == null ? null : Math.round((Date.now() - at) / 36e4) / 10;
   const local = localTime();
@@ -817,8 +901,17 @@ async function status(env) {
   const editionKey = edition ? edition.local_date + (edition.kind === "closing" ? "2" : "1") : null;
   const expectedKey = expected ? expected.date + (expected.kind === "closing" ? "2" : "1") : null;
   const late = Boolean(expectedKey && (!editionKey || editionKey < expectedKey));
+  return {local,expected,ageHours,late};
+}
+async function status(env, knownEdition) {
+  const last = (await env.DB.prepare("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 8").all()).results || [];
+  const edition = knownEdition === undefined ? await latestEdition(env) : knownEdition;
+  const subscribers = await env.DB.prepare("SELECT COUNT(*) count FROM subscribers WHERE status='active'").first();
+  const queued = await env.DB.prepare("SELECT COUNT(*) count FROM email_queue WHERE status IN ('queued','failed')").first();
+  const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
+  const {local,expected,ageHours,late}=editionTiming(edition);
   return {
-    version: "1.4.2-low-signal-faa-filter",
+    version: "1.5.0-source-verification",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -841,7 +934,7 @@ async function status(env) {
   };
 }
 __name(status, "status");
-async function feed(req, env) {
+async function feed(req, env, forHomepage=false) {
   const url = new URL(req.url);
   const day = url.searchParams.get("day"), kind = url.searchParams.get("kind");
   if (day && !dateOK(day)) return message(400, "Invalid date");
@@ -851,7 +944,7 @@ async function feed(req, env) {
   else if (day) edition = await env.DB.prepare("SELECT * FROM editions WHERE local_date=? ORDER BY id DESC LIMIT 1").bind(day).first();
   else if (kind) edition = await env.DB.prepare("SELECT * FROM editions WHERE kind=? ORDER BY id DESC LIMIT 1").bind(kind).first();
   else edition = await latestEdition(env);
-  if (!edition) return j({ edition: null, items: [], latest: await status(env), note: "No scheduled edition has been published yet. Consult /api/activity for verified research findings and source checks." });
+  if (!edition) return j({ edition: null, items: [], latest: forHomepage ? {stale:editionTiming(null).late} : await status(env), note: "No scheduled edition has been published yet. Consult /api/activity for verified research findings and source checks." });
   const rows = await editionItems(env, edition.id);
   let previous = null;
   if (!day && !kind && rows.length === 0) {
@@ -862,28 +955,35 @@ async function feed(req, env) {
       previous = { edition: earlier, items: await editionItems(env, earlier.id) };
     }
   }
-  return j({ edition, items: rows, latest: await status(env), ...(previous ? { previous } : {}) });
+  return j({ edition, items: rows, latest: forHomepage ? {stale:editionTiming(edition).late} : await status(env, day || kind ? undefined : edition), ...(previous ? { previous } : {}) });
 }
 __name(feed, "feed");
 async function article(req, env) {
   const id = decodeURIComponent(new URL(req.url).pathname.slice("/story/".length));
   if (!/^[A-Za-z0-9:_\-]{3,100}$/.test(id)) return new Response("Not found", { status: 404 });
-  const item = await env.DB.prepare("SELECT i.* FROM edition_items i JOIN editions e ON e.id=i.edition_id WHERE i.candidate_id=? ORDER BY e.id DESC LIMIT 1").bind(id).first();
+  let item = await env.DB.prepare("SELECT i.*,e.published_at FROM edition_items i JOIN editions e ON e.id=i.edition_id WHERE i.candidate_id=? ORDER BY e.id DESC LIMIT 1").bind(id).first();
+  if (!item) {
+    const current=await env.DB.prepare("SELECT * FROM candidates WHERE id=? AND status='verified'").bind(id).first();
+    if (verifyPublicStory(current)) item={...current,published_at:current.approved_at || current.first_seen_at};
+  }
   if (!item) return new Response("This regulatory report has not passed publication verification.", { status: 404 });
   const news = (await env.DB.prepare("SELECT * FROM related_news WHERE candidate_id=? ORDER BY published_at DESC LIMIT 15").bind(id).all()).results || [];
   const title = html(item.title), canonical = base(env) + "/story/" + encodeURIComponent(id);
   const section = news.map((x) => `<li><a href="${html(x.url)}" rel="nofollow noopener noreferrer" target="_blank">${html(x.headline)}</a><small> ${html(x.publisher || "")} \xB7 ${html(x.relation)}${x.published_at ? " \xB7 " + html(x.published_at) : ""}</small></li>`).join("");
-  const ld = JSON.stringify({ "@context": "https://schema.org", "@type": "NewsArticle", headline: item.title, datePublished: item.action_date || void 0, mainEntityOfPage: canonical, publisher: { "@type": "Organization", name: "TickerDocket" }, isAccessibleForFree: true }).replace(/</g, "\\u003c");
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} | TickerDocket</title><meta name="description" content="Verified primary-source regulatory research for ${html(item.issuer)} (${html(item.ticker)})."><link rel="canonical" href="${html(canonical)}"><link rel="stylesheet" href="/styles.css"><script type="application/ld+json">${ld}<\/script></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span>TICKER<strong>DOCKET</strong></a><nav><a href="/">Intelligence terminal</a></nav></header><main class="article-wrap"><p class="eyebrow">${html(item.agency || item.source)} \xB7 ${html(item.event_type || "regulatory action")}</p><h1>${title}</h1><p class="lede">Documented direct regulatory exposure: <b>${html(item.issuer)} (${html(item.ticker)})</b></p><div class="story article"><h2>What the official record establishes</h2><p>${html(item.impact_note)}</p><p><b>Agency action date:</b> ${html(item.action_date || "Not provided by source")}</p><h2>Primary evidence</h2><p><a target="_blank" rel="noreferrer noopener" href="${html(item.source_url)}">Official agency document \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.company_evidence_url)}">Public-company / ticker evidence \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.impact_evidence_url)}">Direct exposure evidence \u2197</a></p><h2>Related reporting</h2>${news.length ? `<ul>${section}</ul>` : "<p>No independently verified related news is currently attached.</p>"}<p class="muted">This story reports a documented company relationship\u2014not a prediction that the stock will rise or fall. Regulatory action dates can precede the date the public dataset becomes available.</p></div><p><a href="/">\u2190 Back to TickerDocket</a></p></main><footer><span>\xA9 TickerDocket</span><span>Driftless Digital Ventures</span></footer></body></html>`;
+  const ld = JSON.stringify({ "@context": "https://schema.org", "@type": "NewsArticle", headline: item.title, datePublished: item.published_at || void 0, mainEntityOfPage: canonical, publisher: { "@type": "Organization", name: "TickerDocket" }, isAccessibleForFree: true }).replace(/</g, "\\u003c");
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} | TickerDocket</title><meta name="description" content="Verified primary-source regulatory research for ${html(item.issuer)} (${html(item.ticker)})."><link rel="canonical" href="${html(canonical)}"><link rel="stylesheet" href="/styles.css"><script type="application/ld+json">${ld}<\/script></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span>TICKER<strong>DOCKET</strong></a><nav><a href="/">Intelligence terminal</a></nav></header><main class="article-wrap"><p class="eyebrow">${html(item.agency || item.source)} \xB7 ${html(item.event_type || "regulatory action")}</p><h1>${title}</h1><p class="lede">Documented company exposure · <b>${html(item.issuer)} (${html(item.ticker)})</b></p><div class="story article"><h2>What the official record establishes</h2><p>${html(item.impact_note)}</p><p><b>Agency action date:</b> ${html(item.action_date || "Not provided by source")}</p><h2>Primary evidence</h2><p><a target="_blank" rel="noreferrer noopener" href="${html(item.source_url)}">Primary source document \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.company_evidence_url)}">Public-company / ticker evidence \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.impact_evidence_url)}">Direct exposure evidence \u2197</a></p><h2>Related reporting</h2>${news.length ? `<ul>${section}</ul>` : "<p>No independently verified related news is currently attached.</p>"}<p class="muted">This story reports a documented company relationship\u2014not a prediction that the stock will rise or fall. Regulatory action dates can precede the date the public dataset becomes available.</p></div><p><a href="/">\u2190 Back to TickerDocket</a></p></main><footer><span>\xA9 TickerDocket</span><span>Driftless Digital Ventures</span></footer></body></html>`;
   return new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=120", "X-Content-Type-Options": "nosniff", ...new URL(req.url).hostname.startsWith("tickerdocket-engine-v13-preview.") ? { "X-Robots-Tag": "noindex, nofollow" } : {} } });
 }
 __name(article, "article");
 async function sitemap(env) {
-  const items = (await env.DB.prepare(`SELECT i.candidate_id, MAX(e.published_at) AS edition_changed,
-    (SELECT MAX(n.verified_at) FROM related_news n WHERE n.candidate_id=i.candidate_id) AS news_changed
-    FROM edition_items i JOIN editions e ON e.id=i.edition_id
-    GROUP BY i.candidate_id ORDER BY i.candidate_id LIMIT 3000`).all()).results || [];
-  const entries = [{loc:base(env)}, {loc:base(env)+"/about"}, {loc:base(env)+"/method"},
+  const items=(await env.DB.prepare(`WITH stories AS (
+    SELECT i.candidate_id AS id, e.published_at AS changed FROM edition_items i JOIN editions e ON e.id=i.edition_id
+    UNION ALL SELECT id,COALESCE(approved_at,first_seen_at) FROM candidates WHERE status='verified'
+      AND ticker IS NOT NULL AND issuer IS NOT NULL AND LENGTH(TRIM(impact_note))>0
+      AND source_url LIKE 'https://%' AND company_evidence_url LIKE 'https://%' AND impact_evidence_url LIKE 'https://%')
+    SELECT s.id AS candidate_id,MAX(s.changed) AS edition_changed,(SELECT MAX(n.verified_at) FROM related_news n WHERE n.candidate_id=s.id) AS news_changed
+    FROM stories s GROUP BY s.id ORDER BY MAX(s.changed) DESC LIMIT 3000`).all()).results || [];
+  const entries = [{loc:base(env),lastmod:items[0]?.edition_changed || null}, {loc:base(env)+"/coverage"}, {loc:base(env)+"/about"}, {loc:base(env)+"/method"},
     ...items.filter(x => /^[A-Za-z0-9:_-]{3,100}$/.test(x.candidate_id || "")).map(x => {
       const dates = [x.edition_changed, x.news_changed].map(v => Date.parse(v || "")).filter(v => Number.isFinite(v) && v <= Date.now());
       return {loc:base(env)+"/story/"+encodeURIComponent(x.candidate_id), lastmod:dates.length ? new Date(Math.max(...dates)).toISOString() : null};
@@ -901,8 +1001,14 @@ async function admin(request, env) {
     if (path === "/api/admin/queue") {
       const state = u.searchParams.get("status") || "pending";
       if (!["pending", "verified", "rejected"].includes(state)) return message(400, "Bad status");
-      const rows = (await env.DB.prepare("SELECT * FROM candidates WHERE status=? ORDER BY first_seen_at DESC LIMIT 250").bind(state).all()).results || [];
-      return j({ candidates: rows });
+      await ensurePipeline(env.DB);
+      const offset=Number(u.searchParams.get('offset')||0);
+      if (!Number.isSafeInteger(offset) || offset<0) return message(400,'Invalid offset');
+      const rows=(await env.DB.prepare(`SELECT c.*,a.outcome AS review_outcome,a.detail AS review_detail
+        FROM candidates c LEFT JOIN review_attempts a ON a.candidate_id=c.id WHERE c.status=?
+        ORDER BY CASE WHEN a.outcome='editor_review' THEN 0 WHEN c.id LIKE 'lead:%' AND c.source NOT LIKE 'SEC %' THEN 1 ELSE 2 END,
+        c.action_date DESC,c.first_seen_at DESC,c.id LIMIT 51 OFFSET ?`).bind(state,offset).all()).results||[];
+      return j({candidates:rows.slice(0,50),next_offset:rows.length>50?offset+50:null});
     }
     if (path === "/api/admin/mappings") return j({ mappings: (await env.DB.prepare("SELECT * FROM company_mappings ORDER BY applicant_name LIMIT 300").all()).results || [] });
     if (path === "/api/admin/news") {
@@ -945,6 +1051,7 @@ async function admin(request, env) {
     return j({ ok: true, applicant, ticker });
   }
   if (path === "/api/admin/review") {
+    await ensurePipeline(env.DB);
     const id = String(b.id || ""), candidate = await env.DB.prepare("SELECT * FROM candidates WHERE id=?").bind(id).first();
     if (!candidate) return message(404, "Unknown candidate");
     if (b.action === "reject") {
@@ -1000,7 +1107,7 @@ function editorialPage(title, description, body) {
 }
 function informationPage(path) {
   if (path === "/about" || path === "/about/") return editorialPage("About", "Who operates TickerDocket and what the site covers.", '<h2>Independent regulatory reporting</h2><p>TickerDocket is operated by Driftless Digital Ventures, founded by Joshua Rushlo. It tracks federal regulatory actions with documented connections to publicly traded companies.</p><p>The site publishes a morning and closing docket on U.S. market days and checks its sources throughout the day. An empty edition means no new item met the publication criteria in that window; it does not mean the agencies issued no actions.</p><p>Each record links to the government action and supporting company or ticker evidence. TickerDocket is independent of the agencies it monitors and is not an investment adviser. Its coverage is informational, and regulatory exposure alone does not establish a stock price effect.</p><p>For how records are selected and updated, see <a href="/method">the method</a>.</p>');
-  return editorialPage("Method", "How TickerDocket gathers, checks, and publishes regulatory records.", '<h2>How the docket is produced</h2><p>Automated checks collect records from the Federal Register and FDA device approval and clearance sources. Source availability and publication times vary. The site checks these feeds during the day, generally every 30 minutes from 6:00 AM to 9:00 PM Central.</p><p>Candidate actions are matched to a publicly traded issuer using documented company, ownership, or ticker evidence, including company filings where applicable. A record requires an official source URL, a documented company connection, and an evidence note before it can appear in a public edition. Ambiguous matches are held for review rather than published as confirmed exposure.</p><p>Newly qualified records are captured in a morning edition at 8:00 AM Central and a closing edition at 4:30 PM Central on U.S. market days. Editions are snapshots. Later source checks can identify new candidates for a later edition, and a quiet edition may display an earlier edition with findings while clearly labeling its date.</p><p>Device approval, clearance, or a federal rule does not by itself establish financial materiality or predict a stock move. Read the linked primary record and company evidence before drawing a conclusion. See <a href="/about">who runs the site</a>.</p>');
+  return editorialPage("Method", "How TickerDocket gathers, checks, and publishes regulatory records.", '<h2>How the docket is produced</h2><p>TickerDocket checks Federal Register public inspection, FDA drugs, biologics, recalls, press releases, device decisions, the CMS newsroom, SEC 8-K and 6-K filings, GlobeNewswire biotechnology and public companies, Business Wire Health, PR Newswire Health and Policy, and selected issuer newsrooms. Source availability and publication times vary. The site checks these feeds during the day, generally every 30 minutes from 6:00 AM to 9:00 PM Central.</p><p>Candidate actions are matched to a publicly traded issuer using documented company, ownership, or ticker evidence, including company filings where applicable. A record requires an official source URL, a documented company connection, and an evidence note before it can appear in a public edition. Ambiguous matches are held for review rather than published as confirmed exposure.</p><p>Newly qualified records are captured in a morning edition at 8:00 AM Central and a closing edition at 4:30 PM Central on U.S. market days. Editions are snapshots. Later source checks can identify new candidates for a later edition, and a quiet edition may display an earlier edition with findings while clearly labeling its date.</p><p>Device approval, clearance, or a federal rule does not by itself establish financial materiality or predict a stock move. Read the linked primary record and company evidence before drawing a conclusion. See <a href="/about">who runs the site</a>.</p>');
 }
 async function adminPage(request, env) {
   if (!env.ADMIN_TOKEN) return message(503, "Admin authentication is not configured.");
@@ -1009,20 +1116,17 @@ async function adminPage(request, env) {
   if (credentials !== "admin:" + env.ADMIN_TOKEN) {
     return new Response("Authentication required.", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="TickerDocket admin", charset="UTF-8"', "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow" } });
   }
-  const url = new URL("/admin.html", request.url);
-  const asset = await env.ASSETS.fetch(new Request(url, request));
-  const headers = new Headers(asset.headers);
+  const headers = new Headers({"Content-Type":"text/html; charset=utf-8"});
   headers.set("Cache-Control", "private, no-store");
   headers.set("X-Robots-Tag", "noindex, nofollow");
   headers.set("Vary", "Authorization");
-  return new Response(asset.body, { status: asset.status, headers });
+  return new Response(adminTemplate, { status: 200, headers });
 }
 async function renderHome(request, env) {
-  const asset = await env.ASSETS.fetch(request);
-  if (!asset.ok) return asset;
-  let page = await asset.text();
+  let rendered=false;
+  let page = homeTemplate.replace('id="bot-check"',()=> 'id="bot-check" data-sitekey="'+html(emailReady(env) ? env.TURNSTILE_SITE_KEY : '')+'"');
   try {
-    const data = await (await feed(new Request(new URL('/api/feed', request.url), request), env)).json();
+    const data = await (await feed(new Request(new URL('/api/feed', request.url), request), env, true)).json();
     const edition = data.edition, items = data.items || [], previous = data.previous;
     const showingPrevious = !items.length && previous && previous.items && previous.items.length > 0;
     const displayed = showingPrevious ? previous.items : items;
@@ -1035,22 +1139,62 @@ async function renderHome(request, env) {
       displayed.slice(0,3).map(x => '<a href="/story/' + encodeURIComponent(x.candidate_id || "") + '" class="docket-line"><span class="field-label">TICKER:</span><b>' + html(x.ticker) + '</b><span class="field-label">DOCKET:</span><strong>' + html(x.title) + '</strong></a>').join("") +
       '<div class="docket-board-foot">' + (edition && edition.kind === "morning" ? 'NEXT DOCKET / 16:30 CT' : 'NEXT DOCKET / 08:00 CT') + '</div></aside>';
     const tag = showingPrevious ? editionLabel(previous.edition) + ' · ' + displayed.length + ' ITEMS' : edition ? editionLabel(edition) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION';
+    let coverageHTML='';
+    let editionAudit={}; try {editionAudit=JSON.parse(edition?.notes || '{}');} catch {}
+    if (edition) {
+      const checks=editionAudit.source_coverage?.checks || [];
+      const issues=checks.filter(x=>x.status!=='ok');
+      const label=checks.length ? (checks.length-issues.length)+' of '+checks.length+' sources checked' :
+        edition.scan_status==='checked' ? 'Source coverage complete' : 'Partial source coverage';
+      coverageHTML='<details class="coverage-summary"><summary>'+html(label)+'</summary>'+
+        (checks.length ? '<ul>'+checks.map(x=>'<li>'+html(x.source==='Company releases'?'GlobeNewswire Biotechnology':x.source)+' · '+html(x.status)+'</li>').join('')+'</ul>' :
+          '<p>This edition predates detailed source-by-source coverage records.</p>')+'<p><a href="/coverage">View current source checks ↗</a></p></details>';
+    }
+    let updates='';
+    if (edition) {
+      const delta=(await env.DB.prepare(`SELECT * FROM candidates WHERE status='verified' AND
+        (first_seen_at>? OR approved_at>?) ORDER BY COALESCE(approved_at,first_seen_at) DESC,id LIMIT 18`).bind(edition.published_at,edition.published_at).all()).results||[];
+      const verified=delta.filter(verifyPublicStory);
+      if (verified.length) {
+        const format=new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'});
+        updates='<section class="section" id="since-edition"><h2>Verified since the last edition</h2><ul class="since-list">'+verified.map(x=>{
+          const time=x.approved_at||x.first_seen_at;
+          return '<li><a href="/story/'+encodeURIComponent(x.id)+'"><b>'+html(x.ticker)+'</b>'+html(x.title)+'</a><time datetime="'+html(time)+'">Verified '+html(format.format(new Date(time)))+'</time></li>';
+        }).join('')+'</ul></section>';
+      }
+    }
     const feedSection = '<section id="feed" class="section" data-server-rendered="true"><div class="section-intro"><div><p class="eyebrow">01 / ' + html(showingPrevious ? "PREVIOUS DOCKET" : edition ? String(edition.kind).toUpperCase() + " DOCKET" : "CURRENT DOCKET") + '</p><h2>' + (displayed.length ? 'Latest verified developments' : 'Edition status') + '</h2></div><span class="tag">' + html(tag) + '</span></div>' +
-      (status ? '<p class="market-note"><strong>' + html(edition ? editionLabel(edition) + ' · ' : '') + html(status) + '</strong></p>' : '') +
+      coverageHTML + (status ? '<p class="market-note"><strong>' + html(edition ? editionLabel(edition) + ' · ' : '') + html(status) + '</strong></p>' : '') +
       (showingPrevious ? '<p class="market-note">Showing the most recent edition with verified findings.</p>' : items.length ? '<p class="market-note">Primary-source regulatory actions verified for this edition.</p>' : '') +
       (displayed.length ? '<div class="feed-grid">' + displayed.map(x => {
         const category = x.impact_category === "direct" ? "Directly affects" : x.impact_category === "possible" ? "Could possibly affect" : "";
         return '<article class="story">' + (category ? '<p class="eyebrow">' + html(category) + '</p>' : '') + '<div class="docket-fields"><span>TICKER:</span><b>' + html(x.ticker) + '</b><span>DOCKET:</span><h3>' + html(x.title) + '</h3><span>AGENCY:</span><b>' + html(x.agency || x.source) + '</b><span>FILED:</span><time>' + html(x.action_date || '') + '</time></div><p>' + html(x.impact_note || '') + '</p><a href="/story/' + encodeURIComponent(x.candidate_id || '') + '">Open verified record ↗</a></article>';
       }).join("") + '</div>' : '') + '</section>';
-    page = page.replace(/<aside class="docket-board">[\s\S]*?<\/aside>/, () => board)
+    page = page.replace('<!-- VERIFIED_ACTIVITY -->',()=>updates).replace(/<aside class="docket-board">[\s\S]*?<\/aside>/, () => board)
       .replace(/<section id="feed" class="section">[\s\S]*?<\/section>/, () => feedSection);
+    rendered=true;
   } catch (e) {
     console.error("Homepage server rendering failed:", err(e));
   }
-  const headers = new Headers(asset.headers);
-  headers.delete("Content-Length"); headers.delete("ETag"); headers.delete("Content-Encoding");
-  headers.set("Cache-Control", "no-store");
-  return new Response(page, {status:asset.status, headers});
+  const headers = new Headers({"Content-Type":"text/html; charset=utf-8","X-Content-Type-Options":"nosniff"});
+  headers.set("Cache-Control", rendered ? "public, max-age=0, s-maxage=20" : "no-store");
+  if (!rendered) headers.set("Retry-After","30");
+  return new Response(page, {status:rendered ? 200 : 503, headers});
+}
+async function serviceReviewQueue(env,date) {
+  await ensurePipeline(env.DB);
+  // New source sets receive a current scan even when deployed outside the regular scan window.
+  const key='source-set:'+EXPECTED_SOURCES.join('|');
+  const lease=await env.DB.prepare(`INSERT INTO pipeline_state(key,value) VALUES(?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pipeline_state.value!='ready' AND pipeline_state.value<?`)
+    .bind(key,new Date(Date.now()+20*60000).toISOString(),nowISO()).run();
+  if (lease.meta?.changes) {
+    const result=await scanSource(env,'all',date,true);
+    if (result.disclosures?.available) await env.DB.prepare("UPDATE pipeline_state SET value='ready' WHERE key=?").bind(key).run();
+    return;
+  }
+  const reviewed=await reviewPending(env.DB,date);
+  if (reviewed.examined) await logRun(env,'document review',date.toISOString(),'ok',reviewed.examined,reviewed.verified);
 }
 var worker_default = {
   async fetch(request, env, ctx) {
@@ -1059,7 +1203,18 @@ var worker_default = {
       if (p === "/admin" || p === "/admin/" || p === "/admin.html") return adminPage(request, env);
       if (p === "/about" || p === "/about/" || p === "/method" || p === "/method/") return informationPage(p);
       if (p === "/robots.txt") return new Response("User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /admin.html\n\nSitemap: https://tickerdocket.com/sitemap.xml\n", { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=300" } });
-      if ((p === "/" || p === "/index.html") && request.method === "GET") return renderHome(request, env);
+      if ((p === "/" || p === "/index.html") && request.method === "GET") {
+        const cache=globalThis.caches?.default;
+        if (!cache) return renderHome(request,env);
+        const key=new Request(new URL('/_public-cache/v1.5.0/home',request.url).href);
+        const cached=await cache.match(key);
+        if (cached) return cached;
+        const response=await renderHome(request,env);
+        if (response.ok) ctx.waitUntil(cache.put(key,response.clone()));
+        return response;
+      }
+      if (p==='/coverage' && request.method==='GET') return coveragePage(env);
+      if (p==='/api/coverage' && request.method==='GET') return j(await collectionHealth(env));
       if (p === "/api/status" && request.method === "GET") return j(await status(env));
       if (p === "/api/feed" && request.method === "GET") return feed(request, env);
       if (p === "/api/activity" && request.method === "GET") return j(await activity(env));
@@ -1099,12 +1254,13 @@ var worker_default = {
         try {
           await publish(env, plan.publish, local, scanResult);
         } catch (e) {
-          console.error("Scheduled edition failed", err(e));
+          console.error("Scheduled edition failed",err(e)); await logRun(env,"edition publication",nowISO(),"error",0,0,err(e));
         }
       })());
     } else if (plan.scan) {
       ctx.waitUntil(scanSource(env, "all", new Date(trigger.scheduledTime)).catch((e) => console.error("Source refresh failed", err(e))));
     }
+    if (!plan.publish && !plan.scan) ctx.waitUntil(serviceReviewQueue(env,new Date(trigger.scheduledTime)).catch(e=>logRun(env,'pipeline service',nowISO(),'error',0,0,err(e))));
     if (plan.email) ctx.waitUntil(flushMail(env, 25, local.day).catch((e) => console.error("Morning email queue failed", err(e))));
   }
 };

@@ -1,5 +1,5 @@
-export const EXPECTED_SOURCES = ['federal', '510k', 'pma', 'FDA biologics', 'FDA drugs',
-  'FDA press-releases', 'FDA recalls', 'CMS newsroom', 'Company releases', 'SEC 8-K', 'SEC 6-K'];
+import { DISCLOSURE_FEEDS } from './regulatory-discovery.mjs';
+export const EXPECTED_SOURCES = ['federal','510k','pma',...DISCLOSURE_FEEDS.map(feed => feed.name)];
 
 export function describeCoverage(rows, at) {
   const cutoff = Date.parse(at);
@@ -34,6 +34,7 @@ export function editionOutcome(count, coverage, pending) {
 export function editionNotice(edition) {
   let audit;
   try { audit = JSON.parse(edition?.notes || '{}'); } catch { audit = {}; }
-  if (audit.pending_review_count) return `${audit.pending_review_count} discovered leads await verification. Zero verified findings does not establish that no qualifying stories occurred.`;
+  const pending=audit.window_pending_count ?? audit.pending_review_count;
+  if (pending) return `${pending} leads from this edition’s collection window await verification.`;
   return edition?.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
 }

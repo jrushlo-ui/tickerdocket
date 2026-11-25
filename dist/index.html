@@ -87,7 +87,7 @@
 
     const subscribe = document.querySelector('#subscribe');
     if (subscribe) {
-      subscribe.addEventListener('submit', () => {
+      subscribe.addEventListener('briefing-signup-success', () => {
         const email = subscribe.querySelector('input[type="email"]');
         event('newsletter_signup', {
           method: 'tickerdocket_briefing',
@@ -104,14 +104,15 @@
     }
   })();
 </script><!-- GA4 instrumentation deployed for TickerDocket; add ?ga_debug=1 for DebugView testing. -->
-</head>
+<style>.subscribe .consent{display:flex;align-items:flex-start;gap:.55rem;font:14px/1.4 system-ui;text-transform:none;letter-spacing:normal;margin-top:12px}.subscribe .consent input{flex:none;width:1.1rem;height:1.1rem;margin:1px}.subscribe #signup-status{display:block;margin-top:.4rem}.since-list{display:grid;gap:0;list-style:none;padding:0;margin:0}.since-list li{border-top:1px solid var(--line);padding:.8rem 0}.since-list b{color:var(--teal);margin-right:.75rem}.since-list time{display:block;color:var(--muted);font-size:.82rem}.coverage-summary{font-size:.9rem;margin:1rem 0}.coverage-summary li{margin:.25rem 0}</style></head>
 <body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="#feed">Live feed</a><a href="#method">Method</a><a href="#briefing">Briefing</a><a class="nav-cta" href="#subscribe">Get the 08:00 CT edition</a></nav></header>
 <main><section class="hero"><div class="hero-copy"><p class="eyebrow"><span class="pulse"></span> REGULATORY INTELLIGENCE TERMINAL</p><h1>Government moves.<br><em>Markets react.</em></h1><p class="lede">Verified federal actions, documented company exposure, and the market context that matters next.</p><div class="hero-actions"><a class="button" href="#feed">Open live feed <span>↗</span></a><a class="text-link" href="#method">How verification works</a></div></div><aside class="docket-board"><div class="docket-board-head"><span>LATEST EDITION</span><span><i class="live-dot"></i> LIVE</span></div><div class="docket-empty">Loading the latest edition…</div></aside></section>
 <section class="ticker-row"><div><small>AGENCY SIGNALS</small><strong>FDA · SEC · EPA · FEDERAL REGISTER</strong></div><div><small>VERIFIED EXPOSURE</small><strong class="teal">NO UNVERIFIED TICKERS</strong></div><div><small>EDITION WINDOW</small><strong>08:00 / 16:30 CT</strong></div></section>
+<!-- VERIFIED_ACTIVITY -->
 <section id="feed" class="section"><div class="section-intro"><div><p class="eyebrow">01 / CURRENT DOCKET</p><h2>Latest verified actions</h2></div><span class="tag">LOADING EDITION</span></div><p class="market-note">Loading current verified records…</p></section>
 <section id="method" class="method"><div><p class="eyebrow">02 / THE DOCKET STANDARD</p><h2>No signal without a source.</h2><p>Every published item carries an agency link, publication timestamp, evidence note, and confidence state. “Unknown” is a valid result.</p></div><div class="steps"><div><b>01</b><span>Capture</span><p>Primary federal source collected.</p></div><div><b>02</b><span>Verify</span><p>Company exposure tied to evidence.</p></div><div><b>03</b><span>Publish</span><p>Edition released at a fixed CT window.</p></div></div></section>
-<section id="briefing" class="briefing"><div><p class="eyebrow">03 / DAILY BRIEFING</p><h2>Start before the bell.</h2><p>One concise morning edition, built for operators who need the source and the consequence.</p></div><form id="subscribe" class="subscribe"><label for="email">Morning briefing, 08:00 CT</label><div><input id="email" type="email" placeholder="Email delivery coming soon" disabled><button type="button" disabled>Coming soon</button></div><small>Email delivery is not connected yet. No addresses are being collected or saved.</small></form></section>
-<section class="sponsor"><span class="ad-label">DIRECT SPONSORSHIP / AD SLOT</span><strong>Your brand beside the signal.</strong><a href="mailto:partners@tickerdocket.com">Partner with TickerDocket ↗</a></section></main><footer><span>© 2026 TickerDocket</span><span>Built for Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a></span></footer><script>
+<section id="briefing" class="briefing"><div><p class="eyebrow">03 / DAILY BRIEFING</p><h2>Start before the bell.</h2><p>One concise morning edition, built for operators who need the source and the consequence.</p></div><form id="subscribe" class="subscribe"><label for="email">Morning briefing, 8:00 a.m. Central</label><div><input id="email" type="email" name="email" autocomplete="email" placeholder="you@example.com" required maxlength="254"><button type="submit">Subscribe</button></div><label class="consent"><input type="checkbox" name="agree" required> Email me the TickerDocket morning briefing.</label><div id="bot-check"></div><small id="signup-status" role="status" aria-live="polite"></small><noscript>Enable JavaScript to complete the signup verification.</noscript></form></section>
+<section class="sponsor"><span class="ad-label">DIRECT SPONSORSHIP / AD SLOT</span><strong>Your brand beside the signal.</strong><a href="mailto:partners@tickerdocket.com">Partner with TickerDocket ↗</a></section></main><footer><span>© 2026 TickerDocket</span><span>Built for Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a> · <a href="/coverage">Source coverage</a></span></footer><script>
 (function () {
   var root = document.documentElement;
   var esc = function (v) {
@@ -133,6 +134,10 @@
       hour:'numeric', minute:'2-digit', timeZoneName:'short'
     }).format(date);
   };
+  if (document.querySelector('#feed[data-server-rendered]')) {
+    root.classList.remove('live-loading');
+    return;
+  }
   var render = function (payload) {
     var edition = payload.edition;
     var items = payload.items;
@@ -151,7 +156,8 @@
       status = 'The next edition is delayed.';
     } else if (!items.length) {
       let audit = {}; try { audit = JSON.parse(edition.notes || '{}'); } catch {}
-      status = audit.pending_review_count ? `${audit.pending_review_count} discovered leads await verification. Zero verified findings does not establish that no qualifying stories occurred.` : edition.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
+      var pending = audit.window_pending_count ?? audit.pending_review_count;
+      status = pending ? `${pending} leads from this edition’s collection window await verification.` : edition.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
     }
     var previousLabel = showingPrevious ? editionLabel(previous.edition) : '';
     if (board) {
@@ -180,7 +186,7 @@
     }
     root.classList.remove('live-loading');
   };
-  fetch('/api/feed?live=' + Date.now(), {cache:'no-store'}).then(function (r) {
+  fetch('/api/feed', {cache:'no-store'}).then(function (r) {
     if (!r.ok) throw new Error('Edition feed unavailable');
     return r.json();
   }).then(render).catch(function () {
@@ -204,6 +210,46 @@
     setTimeout(function () { window.location.reload(); }, delay);
   };
   nextBoundary();
+})();
+</script><script>
+(function () {
+  const form=document.getElementById('subscribe'), box=document.getElementById('bot-check');
+  if (!box) return;
+  const status=document.getElementById('signup-status'), submit=form.querySelector('button');
+  const siteKey=box.dataset.sitekey;
+  if (!siteKey) {submit.disabled=true; status.textContent='Newsletter enrollment is temporarily unavailable.';return;}
+  let widget=null,loading=false;
+  function loadChallenge() {
+    if (loading || widget!==null) return;
+    loading=true;
+    window.tickerDocketChallengeReady=function () {
+      widget=window.turnstile.render(box,{sitekey:siteKey,theme:'auto',
+        'error-callback':function(){status.textContent='Verification could not finish. Retry the check.';}});
+      loading=false;
+    };
+    const script=document.createElement('script');
+    script.src='https://challenges.cloudflare.com/turnstile/v0/api.js?onload=tickerDocketChallengeReady&render=explicit';
+    script.async=true;
+    script.onerror=function(){loading=false;script.remove();status.textContent='Verification could not load. Select Subscribe to retry.';};
+    document.head.append(script);
+  }
+  form.addEventListener('focusin',loadChallenge);
+  form.addEventListener('submit',async function(event) {
+    event.preventDefault();
+    if (!form.reportValidity() || submit.disabled) return;
+    loadChallenge();
+    const answer=widget===null?'':window.turnstile.getResponse(widget);
+    if (!answer) {status.textContent='Complete the verification below the consent checkbox, then select Subscribe.';return;}
+    submit.disabled=true;status.textContent='Submitting…';
+    try {
+      const response=await fetch('/api/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        email:form.elements.email.value,agree:form.elements.agree.checked,turnstile:answer})});
+      const data=await response.json();
+      if (!response.ok || !data.ok) throw Error(data.error||'Signup could not finish. Please try again.');
+      status.textContent=data.message;form.dispatchEvent(new Event('briefing-signup-success'));form.reset();
+    } catch(error) {status.textContent=error.message;}
+    finally {window.turnstile.reset(widget);submit.disabled=false;}
+  });
 })();
 </script></body></html>
 

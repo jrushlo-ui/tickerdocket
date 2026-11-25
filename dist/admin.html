@@ -18,8 +18,9 @@
   </form>
   <p id="result" role="status"></p>
   <ol id="leads"></ol>
+  <button id="more" type="button" hidden>Show more leads</button>
   <form id="review" hidden>
-    <h2 id="title"></h2>
+    <h2 id="title"></h2><p id="review-reason"></p>
     <p><a id="source" target="_blank" rel="noopener noreferrer">Open source record</a></p>
     <p><label>Ticker <input name="ticker" required></label></p>
     <p><label>Public company <input name="issuer" required></label></p>
@@ -58,6 +59,8 @@
   function select(lead) {
     selected = lead;
     review.reset();
+    const detail=JSON.parse(lead.review_detail||'{}');
+    document.querySelector('#review-reason').textContent=detail.reason||'';
     document.querySelector('#title').textContent = lead.title;
     const source = document.querySelector('#source');
     const url = new URL(lead.source_url);
@@ -67,9 +70,14 @@
     review.scrollIntoView();
   }
 
-  async function refresh() {
-    const { candidates } = await api('queue');
-    list.replaceChildren(...candidates.map((lead) => {
+  let nextOffset=null;
+  const more=document.getElementById('more');
+  more.addEventListener('click',()=>refresh(nextOffset).catch(error=>{result.textContent=error.message;}));
+  async function refresh(offset=0) {
+    const {candidates,next_offset}=await api('queue?offset='+offset);
+    nextOffset=next_offset; more.hidden=nextOffset===null;
+    if (!offset) list.replaceChildren();
+    list.append(...candidates.map((lead) => {
       const entry = document.createElement('li');
       const button = document.createElement('button');
       button.type = 'button';
@@ -78,7 +86,7 @@
       entry.append(button);
       return entry;
     }));
-    result.textContent = candidates.length + ' pending leads displayed.';
+    result.textContent = list.children.length + ' pending leads displayed.';
   }
 
   load.addEventListener('submit', (event) => {
