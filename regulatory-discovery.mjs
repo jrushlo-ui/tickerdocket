@@ -1,3 +1,4 @@
+import { syndicatedIndex } from './wire-syndication.mjs';
 const FDA_FEEDS = ['biologics', 'drugs', 'press-releases', 'recalls'].map(name => ({
   name: 'FDA ' + name, url: 'https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/' + name + '/rss.xml',
 }));
@@ -77,7 +78,7 @@ function inspectFeed(feed, xml, at) {
     else if (feed.kind === 'sec' && !new RegExp('^' + feed.name.slice(4) + '(?:/A)?\\s+-','i').test(item.title)) reason = 'different filing form';
     else {
       reason = 'candidate';
-      records.push({source:feed.name, source_url:url, title:item.title, action_date:new Date(time).toISOString().slice(0,10),
+      records.push({source:feed.name, source_url:url, title:item.title, action_date:(url.match(/^https:\/\/www\.globenewswire\.com\/(?:[a-z]{2}\/)?news-release\/(\d{4}\/\d{2}\/\d{2})\//i)?.[1] || new Date(time).toISOString().slice(0,10)).replaceAll('/','-'),
         agency:feed.name.startsWith('FDA ') ? 'FDA' : feed.kind === 'sec' ? 'SEC' : feed.kind === 'cms' ? 'CMS' : 'Issuer disclosure'});
     }
     decisions.push([url || String(item.link || '').slice(0,400), item.date || '', reason]);
@@ -111,9 +112,15 @@ export async function readDiscoverySource(feed, at, fetcher, state = {}, pageBud
     if (feed.kind !== 'sec') {
       let page;
       const fromSnapshot=async()=>{
-        const cached=await snapshotReader?.(feed,at);
+        let cached=await snapshotReader?.(feed,at);
+        if(!cached && feed.alternate && !preferSnapshot) {
+          try { cached=await syndicatedIndex(feed,at,fetcher); }
+          catch (e) {attempts.push({url:'https://cloud.feedly.com/v3/streams/contents',error:String(e.message||e)});}
+        }
         if (!cached) return null;
-        attempts.push({url:cached.url,ok:true,via:'publisher RSS collector',observed_at:cached.fetched_at,sha256:cached.sha256});
+        const via=cached.via || 'publisher RSS collector';
+        if(via==='syndicated index') coverage_error='Syndicated releases available. Direct publisher coverage and exact release times are unconfirmed.';
+        attempts.push({url:cached.endpoint||cached.url,ok:true,via,observed_at:cached.fetched_at,origin_updated_at:cached.origin_updated_at||null,sha256:cached.sha256||null});
         return inspectFeed(feed,cached.body,at);
       };
       if(preferSnapshot) page=await fromSnapshot();

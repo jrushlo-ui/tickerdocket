@@ -3,6 +3,7 @@ const pipelineReady = new WeakMap();
 export async function ensurePipeline(DB) {
   if (!pipelineReady.has(DB)) {
     const statements = [
+      'CREATE TABLE IF NOT EXISTS wire_provenance(source TEXT NOT NULL,fetched_at TEXT NOT NULL,sha256 TEXT NOT NULL,via TEXT NOT NULL,origin_updated_at TEXT NOT NULL,PRIMARY KEY(source,fetched_at,sha256))',
       'CREATE TABLE IF NOT EXISTS wire_content(sha256 TEXT PRIMARY KEY,body TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS wire_receipts(source TEXT NOT NULL,url TEXT NOT NULL,fetched_at TEXT NOT NULL,received_at TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(source,fetched_at,sha256))',
       'CREATE TABLE IF NOT EXISTS pipeline_state (key TEXT PRIMARY KEY,value TEXT NOT NULL)',

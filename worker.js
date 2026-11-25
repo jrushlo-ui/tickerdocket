@@ -568,12 +568,7 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
   }
   if (disclosures) results.disclosures = await disclosures;
   if (source==='all') {
-    await env.DB.prepare(`INSERT OR IGNORE INTO review_attempts(candidate_id,attempted_at,outcome,detail,next_at)
-      SELECT id,?,CASE WHEN source LIKE 'FDA %' THEN 'ownership_review' ELSE 'policy_review' END,
-        CASE WHEN source LIKE 'FDA %' THEN json_object('reason','Applicant requires verified issuer identity or parent ownership','applicant',applicant)
-          ELSE json_object('reason','Federal action requires documented public-company exposure') END,NULL
-      FROM candidates WHERE status='pending' AND (id LIKE '510k:%' OR id LIKE 'pma:%' OR id LIKE 'fr-%')
-      AND NOT EXISTS(SELECT 1 FROM review_attempts a WHERE a.candidate_id=candidates.id)`).bind(nowISO()).run();
+    await classifyUnmatched(env);
     try { results.review=await reviewPending(env.DB,new Date(),fetcher,5); }
     catch(error) { results.review={error:err(error)}; await logRun(env,'document review',nowISO(),'error',0,0,err(error)); }
   }
@@ -937,7 +932,7 @@ async function status(env, knownEdition) {
   const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
   const {local,expected,ageHours,late}=editionTiming(edition);
   return {
-    version: "1.5.1-source-verification",
+    version: "1.5.2-source-verification",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -1207,6 +1202,14 @@ async function renderHome(request, env) {
   if (!rendered) headers.set("Retry-After","30");
   return new Response(page, {status:rendered ? 200 : 503, headers});
 }
+async function classifyUnmatched(env) {
+    await env.DB.prepare(`INSERT OR IGNORE INTO review_attempts(candidate_id,attempted_at,outcome,detail,next_at)
+      SELECT id,?,CASE WHEN source LIKE 'FDA %' THEN 'ownership_review' ELSE 'policy_review' END,
+        CASE WHEN source LIKE 'FDA %' THEN json_object('reason','Applicant requires verified issuer identity or parent ownership','applicant',applicant)
+          ELSE json_object('reason','Federal action requires documented public-company exposure') END,NULL
+      FROM candidates WHERE status='pending' AND (id LIKE '510k:%' OR id LIKE 'pma:%' OR id LIKE 'fr-%')
+      AND NOT EXISTS(SELECT 1 FROM review_attempts a WHERE a.candidate_id=candidates.id)`).bind(nowISO()).run();
+}
 async function serviceReviewQueue(env,date) {
   await ensurePipeline(env.DB);
   // New source sets receive a current scan even when deployed outside the regular scan window.
@@ -1223,8 +1226,34 @@ async function serviceReviewQueue(env,date) {
     (SELECT MAX(id) FROM sync_runs WHERE source IN ('SEC 8-K','SEC 6-K') GROUP BY source)
     AND s.status!='ok' AND s.ended_at<?`).bind(new Date(date.getTime()-3*60000).toISOString()).all()).results||[];
   if(debts.length) await scanDisclosures(env,date,localTime(date).day,fetch,{names:debts.map(x=>x.source)});
+  await classifyUnmatched(env);
   const reviewed=await reviewPending(env.DB,date);
   if (reviewed.examined) await logRun(env,'document review',date.toISOString(),'ok',reviewed.examined,reviewed.verified);
+}
+async function runScheduledSlot(trigger,env) {
+  const date=new Date(trigger.scheduledTime),local=localTime(date),plan=schedulePlan(local);
+  await ensurePipeline(env.DB);
+  const slot=new Date(Math.floor(date.getTime()/300000)*300000).toISOString();
+  const claimed=await env.DB.prepare(`INSERT INTO pipeline_state(key,value) VALUES('scheduled-slot',?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pipeline_state.value<excluded.value`).bind(slot).run();
+  if(!claimed.meta?.changes) return;
+  if(!plan.publish && isMarketDay(local)) {
+    const retryKind=local.hour===8 && [5,10,15].includes(local.minute) ? 'morning' :
+      local.hour===16 && [35,40,45].includes(local.minute) ? 'closing' : null;
+    if(retryKind && !await latestEdition(env,local.day,retryKind)) plan.publish=retryKind;
+  }
+  const cycle=async()=>{
+    if(plan.publish) {
+      let result;
+      try {result=await scanSource(env,'all',date,true);}
+      catch(e) {await logRun(env,'pipeline service',nowISO(),'error',0,0,err(e));}
+      await publish(env,plan.publish,local,result);
+    } else if(plan.scan) await scanSource(env,'all',date);
+    else await serviceReviewQueue(env,date);
+  };
+  try {await cycle();}
+  catch(e) {await logRun(env,plan.publish?'edition publication':'pipeline service',nowISO(),'error',0,0,err(e));}
+  if(plan.email) await flushMail(env,25,local.day);
 }
 var worker_default = {
   async fetch(request, env, ctx) {
@@ -1236,7 +1265,7 @@ var worker_default = {
       if ((p === "/" || p === "/index.html") && request.method === "GET") {
         const cache=globalThis.caches?.default;
         if (!cache) return renderHome(request,env);
-        const key=new Request(new URL('/_public-cache/v1.5.1/home',request.url).href);
+        const key=new Request(new URL('/_public-cache/v1.5.2/home',request.url).href);
         const cached=await cache.match(key);
         const response=cached || await renderHome(request,env);
         if (!cached && response.ok) {
@@ -1286,28 +1315,9 @@ var worker_default = {
       return message(500, "Request failed. Please check Worker logs.");
     }
   },
-  async scheduled(trigger, env, ctx) {
-    const local = localTime(new Date(trigger.scheduledTime));
-    const plan = schedulePlan(local);
-    if (plan.publish) {
-      ctx.waitUntil((async () => {
-        let scanResult;
-        try {
-          scanResult = await scanSource(env, "all", new Date(trigger.scheduledTime), true);
-        } catch (e) {
-          console.error("Pre-edition refresh failed", err(e));
-        }
-        try {
-          await publish(env, plan.publish, local, scanResult);
-        } catch (e) {
-          console.error("Scheduled edition failed",err(e)); await logRun(env,"edition publication",nowISO(),"error",0,0,err(e));
-        }
-      })());
-    } else if (plan.scan) {
-      ctx.waitUntil(scanSource(env, "all", new Date(trigger.scheduledTime)).catch((e) => console.error("Source refresh failed", err(e))));
-    }
-    if (!plan.publish && !plan.scan) ctx.waitUntil(serviceReviewQueue(env,new Date(trigger.scheduledTime)).catch(e=>logRun(env,'pipeline service',nowISO(),'error',0,0,err(e))));
-    if (plan.email) ctx.waitUntil(flushMail(env, 25, local.day).catch((e) => console.error("Morning email queue failed", err(e))));
+  async scheduled(trigger,env,ctx) {
+    ctx.waitUntil(runScheduledSlot(trigger,env));
+
   }
 };
 export {

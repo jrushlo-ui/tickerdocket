@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/wire-feeds.yml'
       - 'collect-wire-feeds.mjs'
+      - 'wire-syndication.mjs'
 permissions:
   contents: read
   id-token: write
