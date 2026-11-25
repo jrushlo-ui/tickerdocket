@@ -1,6 +1,7 @@
+import { trustedCollector,saveWireSnapshots,currentWireSnapshot } from "./wire-collector.mjs";
 import homeTemplate from "./dist/index.html";
 import adminTemplate from "./dist/admin.html";
-import { ensurePipeline,recordDiscovery,saveCheckpoint } from "./pipeline-store.mjs";
+import { ensurePipeline,recordDiscovery } from "./pipeline-store.mjs";
 import { reviewPending } from "./review-queue.mjs";
 import { EXPECTED_SOURCES,describeCoverage, editionOutcome, editionNotice } from "./edition-health.mjs";
 import { evidenceFetcher } from "./source-evidence.mjs";
@@ -436,7 +437,7 @@ async function triagePendingFederal(env) {
   return { reviewed: rows.length, excluded: reject.length, retained_for_review: rows.length - reject.length };
 }
 __name(triagePendingFederal, "triagePendingFederal");
-async function scanDisclosures(env, at, day, fetcher = fetch) {
+async function scanDisclosures(env, at, day, fetcher = fetch, options = {}) {
   await ensurePipeline(env.DB);
   const start = nowISO();
   const reviewedInsert = env.DB.prepare(`INSERT INTO candidates
@@ -459,7 +460,8 @@ async function scanDisclosures(env, at, day, fetcher = fetch) {
   if (reviewedStatements.length) await env.DB.batch(reviewedStatements);
   const stored = (await env.DB.prepare("SELECT key,value FROM pipeline_state WHERE key LIKE 'SEC %'").all()).results || [];
   const states = Object.fromEntries(stored.map(row => [row.key,JSON.parse(row.value)]));
-  const feeds = await discoverRegulatoryLeads(at.getTime(), fetcher, states);
+  const feeds = await discoverRegulatoryLeads(at.getTime(),fetcher,states,{...options,snapshotReader:(feed,time)=>currentWireSnapshot(env.DB,feed,time)});
+  let completed=0;
   for (const feed of feeds) {
     let added = 0;
     try {
@@ -480,15 +482,21 @@ async function scanDisclosures(env, at, day, fetcher = fetch) {
       writes.push(recordDiscovery(env.DB,feed.source,start,{endpoints:feed.attempts,pages:feed.pages,
         raw_entries:feed.decisions.length,accepted:rows.length,dispositions,entries:feed.decisions,
         coverage_error:feed.error || feed.coverage_error || null}));
-      if (feed.next) writes.push(saveCheckpoint(env.DB,feed.source,feed.next));
+      if (feed.next) {
+        const previous=stored.find(row=>row.key===feed.source)?.value || null;
+        writes.push(env.DB.prepare(`INSERT INTO pipeline_state(key,value) VALUES(?,?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pipeline_state.value IS ?`)
+          .bind(feed.source,JSON.stringify(feed.next),previous));
+      }
       writes.push(env.DB.prepare("INSERT INTO sync_runs(source,started_at,ended_at,status,seen_count,inserted_count,error) VALUES(?,?,?,?,?,?,?)")
         .bind(feed.source,start,nowISO(),feed.error ? "error" : feed.coverage_error ? "partial" : "ok",rows.length,added,feed.error || feed.coverage_error || null));
       await env.DB.batch(writes);
+      if (!feed.error) completed++;
     } catch (error) {
       await logRun(env, feed.source, start, "error", feed.records.length, added, err(error));
     }
   }
-  return { sources: feeds.length, available: feeds.filter((feed) => !feed.error).length };
+  return { sources: feeds.length, available: completed };
 }
 async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), capture = false) {
   await ensurePipeline(env.DB);
@@ -560,6 +568,12 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), 
   }
   if (disclosures) results.disclosures = await disclosures;
   if (source==='all') {
+    await env.DB.prepare(`INSERT OR IGNORE INTO review_attempts(candidate_id,attempted_at,outcome,detail,next_at)
+      SELECT id,?,CASE WHEN source LIKE 'FDA %' THEN 'ownership_review' ELSE 'policy_review' END,
+        CASE WHEN source LIKE 'FDA %' THEN json_object('reason','Applicant requires verified issuer identity or parent ownership','applicant',applicant)
+          ELSE json_object('reason','Federal action requires documented public-company exposure') END,NULL
+      FROM candidates WHERE status='pending' AND (id LIKE '510k:%' OR id LIKE 'pma:%' OR id LIKE 'fr-%')
+      AND NOT EXISTS(SELECT 1 FROM review_attempts a WHERE a.candidate_id=candidates.id)`).bind(nowISO()).run();
     try { results.review=await reviewPending(env.DB,new Date(),fetcher,5); }
     catch(error) { results.review={error:err(error)}; await logRun(env,'document review',nowISO(),'error',0,0,err(error)); }
   }
@@ -574,7 +588,7 @@ __name(scanSource, "scanSource");
 // src/activity.js
 async function collectionHealth(env) {
   const at=nowISO(),DB=env.DB;
-  const coverage=await sourceCoverageDetails(env,at);
+  const coverage=await sourceCoverageDetails(env,at,liveFreshnessFrom(at));
   const table=await DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='review_attempts'").first();
   let operations=[],review=[],capture=null,logs=[];
   if (table) {
@@ -583,7 +597,7 @@ async function collectionHealth(env) {
         json_extract(details,'$.pages') pages,json_extract(details,'$.accepted') accepted,
         json_extract(details,'$.coverage_error') error,json_extract(details,'$.endpoints') endpoints FROM discovery_checks
         WHERE id IN (SELECT MAX(id) FROM discovery_checks GROUP BY source)`),
-      DB.prepare(`SELECT CASE WHEN c.status='pending' THEN COALESCE(a.outcome,'awaiting_review') ELSE a.outcome END outcome,
+      DB.prepare(`SELECT CASE WHEN c.status='pending' THEN COALESCE(a.outcome,'awaiting_review') WHEN a.outcome IN ('verified','duplicate','excluded') THEN a.outcome ELSE 'resolved' END outcome,
         COUNT(*) count FROM candidates c LEFT JOIN review_attempts a ON a.candidate_id=c.id
         WHERE c.status='pending' OR a.outcome IS NOT NULL GROUP BY 1`),
       DB.prepare("SELECT source,status,ended_at,error FROM sync_runs WHERE source IN ('document review','source evidence','pipeline service','edition publication') ORDER BY id DESC LIMIT 6"),
@@ -604,15 +618,15 @@ async function coveragePage(env) {
   const data=await collectionHealth(env);
   const ct=v=> v ? new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(new Date(v)) : 'Awaiting first check';
   const names=x=>x==='Company releases'?'GlobeNewswire Biotechnology':x==='federal'?'Federal Register public inspection':x==='510k'?'FDA 510(k)':x==='pma'?'FDA PMA':x;
-  const rows=data.checks.map(c=>'<tr><th scope="row">'+html(names(c.source))+'</th><td>'+html(c.status)+'</td><td>'+html(ct(c.ended_at))+'</td><td>'+html(c.error || '—')+'</td></tr>').join('');
-  const pending=data.reviews.filter(x=>['awaiting_review','editor_review','retry'].includes(x.outcome));
-  const labels={awaiting_review:'Awaiting review',editor_review:'Needs an editor',retry:'Scheduled for another attempt'};
+  const rows=data.checks.map(c=>'<tr><th scope="row">'+html(names(c.source))+'</th><td>'+html(c.status)+'</td><td>'+html(ct(c.ended_at))+'</td><td>'+html(c.error || (c.endpoint_attempts||[]).find(x=>x.via)?.via || '—')+'</td></tr>').join('');
+  const pending=data.reviews.filter(x=>['awaiting_review','editor_review','retry','ownership_review','policy_review'].includes(x.outcome));
+  const labels={awaiting_review:'Awaiting review',editor_review:'Needs an editor',retry:'Scheduled for another attempt',ownership_review:'Needs issuer or ownership evidence',policy_review:'Needs company exposure evidence'};
   const counts=pending.map(x=>'<li>'+html(labels[x.outcome])+': '+Number(x.count)+'</li>').join('');
   return editorialPage('Source coverage','Collection results and review status for the monitored sources.',
     '<h2>Latest checks</h2><p>'+data.expected+' monitored sources. Times are Central. Scheduled collection runs every half hour from 6:00 a.m. to 9:00 p.m., with additional checks before editions.</p>'+
     '<div style="overflow-x:auto"><table><thead><tr><th>Source</th><th>Result</th><th>Last check</th><th>Detail</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
     (counts?'<h2>Review queue</h2><ul>'+counts+'</ul>':'')+
-    (data.latest_evidence?'<p>Last saved source evidence: '+html(ct(data.latest_evidence.scheduled_at))+' · '+Number(data.latest_evidence.requests)+' requests · '+Number(data.latest_evidence.capture_gaps)+' capture gaps.</p>':''));
+    (data.latest_evidence?'<p>Last saved source evidence: '+html(ct(data.latest_evidence.scheduled_at))+' · '+Number(data.latest_evidence.requests)+' requests · '+Number(data.latest_evidence.capture_gaps)+' capture gaps.</p>':''),'coverage');
 }
 async function activity(env) {
   const runs = (await env.DB.prepare(`SELECT source,started_at,ended_at,status,seen_count,inserted_count,error
@@ -649,8 +663,9 @@ async function activity(env) {
   const last = runs.filter((x) => x.ended_at).map((x) => Date.parse(x.ended_at)).filter(Number.isFinite);
   const lastScan = last.length ? new Date(Math.max(...last)).toISOString() : null;
   const refreshWindowActive = expectsFreshSourceCheck(localTime());
-  const checks = describeCoverage(runs,nowISO()).checks;
-  const healthy = checks.every(x=>x.status==='ok' || !refreshWindowActive && x.status==='stale' && runs.find(r=>r.source===x.source)?.status==='ok');
+  const checkedAt=nowISO();
+  const checks=describeCoverage(runs,checkedAt,liveFreshnessFrom(checkedAt)).checks;
+  const healthy=checks.every(x=>x.status==='ok');
   return {
     as_of: nowISO(),
     last_scan_at: lastScan,
@@ -840,11 +855,22 @@ function selectEditionCutoff(previous, now = /* @__PURE__ */ new Date()) {
   return previous?.published_at || new Date(now.getTime() - 72 * 3600 * 1e3).toISOString();
 }
 __name(selectEditionCutoff, "selectEditionCutoff");
-async function sourceCoverageDetails(env, at = nowISO()) {
+function liveFreshnessFrom(at) {
+  const time=new Date(at),local=localTime(time);
+  if (expectsFreshSourceCheck(local)) return time.getTime()-75*60000;
+  // Resolve the previous closing scan in Chicago, including overnight DST changes.
+  const clock=new Date(time); clock.setUTCMinutes(0,0,0);
+  for(let i=0;i<14;i++) {
+    if(localTime(clock).hour===21) return clock.getTime()-75*60000;
+    clock.setUTCHours(clock.getUTCHours()-1);
+  }
+  return time.getTime()-75*60000;
+}
+async function sourceCoverageDetails(env, at = nowISO(), freshnessFrom) {
   const rows = (await env.DB.prepare(`SELECT s.* FROM sync_runs s
     WHERE s.id IN (SELECT MAX(id) FROM sync_runs WHERE ended_at <= ? GROUP BY source)`)
     .bind(at).all()).results || [];
-  return describeCoverage(rows, at);
+  return describeCoverage(rows, at, freshnessFrom);
 }
 async function sourceCoverage(env, at = nowISO()) {
   return (await sourceCoverageDetails(env, at)).status;
@@ -911,7 +937,7 @@ async function status(env, knownEdition) {
   const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
   const {local,expected,ageHours,late}=editionTiming(edition);
   return {
-    version: "1.5.0-source-verification",
+    version: "1.5.1-source-verification",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -1102,8 +1128,8 @@ async function corporate(request, env) {
   });
 }
 __name(corporate, "corporate");
-function editorialPage(title, description, body) {
-  return new Response('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' | TickerDocket</title><meta name="description" content="' + description + '"><link rel="canonical" href="https://tickerdocket.com/' + title.toLowerCase() + '"><link rel="stylesheet" href="/styles.css"></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="/">Live feed</a><a href="/about">About</a><a href="/method">Method</a></nav></header><main class="section"><p class="eyebrow">TICKERDOCKET / ' + title.toUpperCase() + '</p><h1>' + title + '</h1><div class="story" style="max-width:780px;margin-top:28px">' + body + '</div></main><footer><span>© 2026 TickerDocket</span><span>Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a></span></footer></body></html>', { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff" } });
+function editorialPage(title, description, body, slug=title.toLowerCase()) {
+  return new Response('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' | TickerDocket</title><meta name="description" content="' + description + '"><link rel="canonical" href="https://tickerdocket.com/' + slug + '"><link rel="stylesheet" href="/styles.css"></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span><span>TICKER<strong>DOCKET</strong></span></a><nav><a href="/">Live feed</a><a href="/about">About</a><a href="/method">Method</a></nav></header><main class="section"><p class="eyebrow">TICKERDOCKET / ' + title.toUpperCase() + '</p><h1>' + title + '</h1><div class="story" style="max-width:780px;margin-top:28px">' + body + '</div></main><footer><span>© 2026 TickerDocket</span><span>Driftless Digital Ventures</span><span><a href="/about">About</a> · <a href="/method">Method</a></span></footer></body></html>', { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300", "X-Content-Type-Options": "nosniff" } });
 }
 function informationPage(path) {
   if (path === "/about" || path === "/about/") return editorialPage("About", "Who operates TickerDocket and what the site covers.", '<h2>Independent regulatory reporting</h2><p>TickerDocket is operated by Driftless Digital Ventures, founded by Joshua Rushlo. It tracks federal regulatory actions with documented connections to publicly traded companies.</p><p>The site publishes a morning and closing docket on U.S. market days and checks its sources throughout the day. An empty edition means no new item met the publication criteria in that window; it does not mean the agencies issued no actions.</p><p>Each record links to the government action and supporting company or ticker evidence. TickerDocket is independent of the agencies it monitors and is not an investment adviser. Its coverage is informational, and regulatory exposure alone does not establish a stock price effect.</p><p>For how records are selected and updated, see <a href="/method">the method</a>.</p>');
@@ -1159,7 +1185,7 @@ async function renderHome(request, env) {
         const format=new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'});
         updates='<section class="section" id="since-edition"><h2>Verified since the last edition</h2><ul class="since-list">'+verified.map(x=>{
           const time=x.approved_at||x.first_seen_at;
-          return '<li><a href="/story/'+encodeURIComponent(x.id)+'"><b>'+html(x.ticker)+'</b>'+html(x.title)+'</a><time datetime="'+html(time)+'">Verified '+html(format.format(new Date(time)))+'</time></li>';
+          return '<li><a href="/story/'+encodeURIComponent(x.id)+'"><b>'+html(x.ticker)+'</b> '+html(x.title)+'</a><time datetime="'+html(time)+'">Verified '+html(format.format(new Date(time)))+'</time></li>';
         }).join('')+'</ul></section>';
       }
     }
@@ -1193,6 +1219,10 @@ async function serviceReviewQueue(env,date) {
     if (result.disclosures?.available) await env.DB.prepare("UPDATE pipeline_state SET value='ready' WHERE key=?").bind(key).run();
     return;
   }
+  const debts=(await env.DB.prepare(`SELECT s.source FROM sync_runs s WHERE s.id IN
+    (SELECT MAX(id) FROM sync_runs WHERE source IN ('SEC 8-K','SEC 6-K') GROUP BY source)
+    AND s.status!='ok' AND s.ended_at<?`).bind(new Date(date.getTime()-3*60000).toISOString()).all()).results||[];
+  if(debts.length) await scanDisclosures(env,date,localTime(date).day,fetch,{names:debts.map(x=>x.source)});
   const reviewed=await reviewPending(env.DB,date);
   if (reviewed.examined) await logRun(env,'document review',date.toISOString(),'ok',reviewed.examined,reviewed.verified);
 }
@@ -1206,12 +1236,28 @@ var worker_default = {
       if ((p === "/" || p === "/index.html") && request.method === "GET") {
         const cache=globalThis.caches?.default;
         if (!cache) return renderHome(request,env);
-        const key=new Request(new URL('/_public-cache/v1.5.0/home',request.url).href);
+        const key=new Request(new URL('/_public-cache/v1.5.1/home',request.url).href);
         const cached=await cache.match(key);
-        if (cached) return cached;
-        const response=await renderHome(request,env);
-        if (response.ok) ctx.waitUntil(cache.put(key,response.clone()));
-        return response;
+        const response=cached || await renderHome(request,env);
+        if (!cached && response.ok) {
+          const copy=new Response(response.clone().body,response);
+          copy.headers.set('Cache-Control','public, max-age=20');
+          ctx.waitUntil(cache.put(key,copy));
+        }
+        const client=new Response(response.body,response);
+        client.headers.set('Cache-Control','no-store');
+        return client;
+      }
+      if(p==='/api/collector/wires' && request.method==='POST') {
+        if (!await trustedCollector((request.headers.get('Authorization')||'').replace(/^Bearer /,''))) return message(401,'Workflow identity required');
+        if (Number(request.headers.get('content-length')||0)>1200000) return message(413,'Feed payload too large');
+        await ensurePipeline(env.DB);
+        const now=new Date(); let names;
+        try { names=await saveWireSnapshots(env.DB,await request.json(),now.getTime()); }
+        catch(e) {return message(400,err(e));}
+        const tick=new Date();
+        ctx.waitUntil(scanDisclosures(env,tick,localTime(tick).day,fetch,{names,preferSnapshot:true}).catch(e=>logRun(env,'pipeline service',nowISO(),'error',0,0,err(e))));
+        return j({accepted:names,received_at:now.toISOString()});
       }
       if (p==='/coverage' && request.method==='GET') return coveragePage(env);
       if (p==='/api/coverage' && request.method==='GET') return j(await collectionHealth(env));

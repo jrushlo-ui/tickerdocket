@@ -55,3 +55,29 @@ assert.equal(db.prepare('SELECT COUNT(*) n FROM candidate_history').get().n,4);
 assert.throws(()=>db.exec('DELETE FROM candidate_history'),/append-only/);
 assert.equal((await reviewPending(DB,at,fetcher)).examined,0);
 console.log('Passed paginated catch-up, partial-failure recovery, alternate feed, primary-source verification, false-positive, deduplication and append-only history tests.');
+
+const {trustedCollector,saveWireSnapshots,currentWireSnapshot}=await import('./wire-collector.mjs');
+const {publicKey,privateKey}=await crypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
+const jwk={...await crypto.subtle.exportKey('jwk',publicKey),kid:'fixture'};
+const claims={iss:'https://token.actions.githubusercontent.com',aud:'https://tickerdocket.com/api/collector/wires',repository_id:'1443532654',
+  repository_owner_id:'330234919',repository:'jrushlo-ui/tickerdocket',ref:'refs/heads/main',event_name:'schedule',
+  workflow_ref:'jrushlo-ui/tickerdocket/.github/workflows/wire-feeds.yml@refs/heads/main',iat:end/1000-5,exp:end/1000+300};
+const sign=async payload=>{
+  const content=[{alg:'RS256',kid:'fixture'},payload].map(x=>Buffer.from(JSON.stringify(x)).toString('base64url')).join('.');
+  const sig=await crypto.subtle.sign('RSASSA-PKCS1-v1_5',privateKey,new TextEncoder().encode(content));
+  return content+'.'+Buffer.from(sig).toString('base64url');
+};
+const fetchKeys=async()=>Response.json({keys:[jwk]});
+assert(await trustedCollector(await sign(claims),end,fetchKeys));
+assert.equal(await trustedCollector(await sign({...claims,workflow_ref:'foreign'}),end,fetchKeys),false);
+assert.equal(await trustedCollector(await sign({...claims,exp:end/1000-1}),end,fetchKeys),false);
+const wireBody='<rss><channel><item><title>Issuer announces FDA approval</title><pubDate>'+at.toUTCString()+'</pubDate><link>https://www.globenewswire.com/news-release/example</link></item></channel></rss>';
+const hash=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(wireBody))).toString('hex');
+const obs={source:globe.name,url:globe.url,fetched_at:at.toISOString(),sha256:hash,body:wireBody};
+assert.deepEqual(await saveWireSnapshots(DB,{feeds:[obs]},end),[globe.name]);
+assert.equal((await currentWireSnapshot(DB,globe,end)).body,wireBody);
+assert.equal(await currentWireSnapshot(DB,globe,end+46*60000),null);
+const observed=await readDiscoverySource(globe,end,async()=>new Response('unavailable',{status:403}),{},6,(f,t)=>currentWireSnapshot(DB,f,t));
+assert.equal(observed.records.length,1);assert.equal(observed.attempts.at(-1).sha256,hash);
+await assert.rejects(saveWireSnapshots(DB,{feeds:[{...obs,sha256:'invalid'}]},end),/digest/);
+console.log('Passed scoped workflow identity, feed integrity, freshness and independent publisher capture tests.');

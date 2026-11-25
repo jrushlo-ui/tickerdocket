@@ -1,7 +1,7 @@
 import { DISCLOSURE_FEEDS } from './regulatory-discovery.mjs';
 export const EXPECTED_SOURCES = ['federal','510k','pma',...DISCLOSURE_FEEDS.map(feed => feed.name)];
 
-export function describeCoverage(rows, at) {
+export function describeCoverage(rows, at, freshnessFrom = Date.parse(at) - 75 * 60000) {
   const cutoff = Date.parse(at);
   const bySource = new Map();
   for (const row of rows) {
@@ -15,7 +15,7 @@ export function describeCoverage(rows, at) {
   const checks = EXPECTED_SOURCES.map(source => {
     const row = bySource.get(source);
     const age = row ? cutoff - Date.parse(row.ended_at) : Infinity;
-    const fresh = age >= 0 && age < 75 * 60000;
+    const fresh = !!row && age >= 0 && Date.parse(row.ended_at) > freshnessFrom;
     return { source, run_id: row?.id ?? null, ended_at: row?.ended_at ?? null,
       status: !row ? 'missing' : !fresh ? 'stale' : row.status,
       seen_count: row?.seen_count ?? null, error: row?.error ?? null };

@@ -87,14 +87,14 @@ function inspectFeed(feed, xml, at) {
 export function parseDiscoveryFeed(feed, body, at) { return inspectFeed(feed,body,at).records; }
 
 async function readDiscoveryPage(url, fetcher) {
-  const response = await fetcher(url,{headers:{'User-Agent':'TickerDocket public filings monitor newsletter@tickerdocket.com'},signal:AbortSignal.timeout(10000)});
+  const response = await fetcher(url,{headers:{'User-Agent':'TickerDocket public filings monitor newsletter@tickerdocket.com'},signal:AbortSignal.timeout(url.includes('browse-edgar') ? 16000 : 10000)});
   if (!response.ok) throw Error('HTTP ' + response.status);
   return response.text();
 }
 
 // Freeze the upper bound while catching up. Only advance it after reaching the prior
 // completed window. Re-read the overlap accession before accepting an offset on resume.
-export async function readDiscoverySource(feed, at, fetcher, state = {}, pageBudget = 6) {
+export async function readDiscoverySource(feed, at, fetcher, state = {}, pageBudget = 6, snapshotReader, preferSnapshot=false) {
   const records = new Map(), decisions = [], attempts = [];
   let pagesRead = 0, malformed = 0, coverage_error = null, next = null;
   const collect = page => {
@@ -110,9 +110,20 @@ export async function readDiscoverySource(feed, at, fetcher, state = {}, pageBud
   try {
     if (feed.kind !== 'sec') {
       let page;
-      try { page = await pageAt(feed.url); } catch (error) {
-        if (!feed.alternate) throw error;
-        page = await pageAt(feed.alternate);
+      const fromSnapshot=async()=>{
+        const cached=await snapshotReader?.(feed,at);
+        if (!cached) return null;
+        attempts.push({url:cached.url,ok:true,via:'publisher RSS collector',observed_at:cached.fetched_at,sha256:cached.sha256});
+        return inspectFeed(feed,cached.body,at);
+      };
+      if(preferSnapshot) page=await fromSnapshot();
+      if(!page) {
+        try { page=await pageAt(feed.url); }
+        catch (error) {
+          if (!feed.alternate) throw error;
+          try { page=await pageAt(feed.alternate); }
+          catch (other) { page=await fromSnapshot(); if(!page) throw other; }
+        }
       }
       collect(page);
     } else {
@@ -157,8 +168,9 @@ export async function readDiscoverySource(feed, at, fetcher, state = {}, pageBud
       ...(pagesRead ? {coverage_error:String(error.message || error)} : {error:String(error.message || error)})};
   }
 }
-export async function discoverRegulatoryLeads(at, fetcher = fetch, states = {}) {
-  return Promise.all(DISCLOSURE_FEEDS.map(feed=>readDiscoverySource(feed,at,fetcher,states[feed.name])));
+export async function discoverRegulatoryLeads(at, fetcher=fetch, states={}, options={}) {
+  const feeds=options.names ? DISCLOSURE_FEEDS.filter(feed=>options.names.includes(feed.name)) : DISCLOSURE_FEEDS;
+  return Promise.all(feeds.map(feed=>readDiscoverySource(feed,at,fetcher,states[feed.name],6,options.snapshotReader,options.preferSnapshot)));
 }
 
 export const reviewedLaunchItems = [

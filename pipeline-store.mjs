@@ -3,6 +3,8 @@ const pipelineReady = new WeakMap();
 export async function ensurePipeline(DB) {
   if (!pipelineReady.has(DB)) {
     const statements = [
+      'CREATE TABLE IF NOT EXISTS wire_content(sha256 TEXT PRIMARY KEY,body TEXT NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS wire_receipts(source TEXT NOT NULL,url TEXT NOT NULL,fetched_at TEXT NOT NULL,received_at TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(source,fetched_at,sha256))',
       'CREATE TABLE IF NOT EXISTS pipeline_state (key TEXT PRIMARY KEY,value TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS discovery_checks (id INTEGER PRIMARY KEY,source TEXT NOT NULL,started_at TEXT NOT NULL,details TEXT NOT NULL)',
       'CREATE INDEX IF NOT EXISTS discovery_source_time ON discovery_checks(source,started_at)',
@@ -29,7 +31,4 @@ export async function ensurePipeline(DB) {
 }
 export function recordDiscovery(DB,source,at,details) {
   return DB.prepare('INSERT INTO discovery_checks(source,started_at,details) VALUES(?,?,?)').bind(source,at,JSON.stringify(details));
-}
-export function saveCheckpoint(DB,key,value) {
-  return DB.prepare('INSERT INTO pipeline_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind(key,JSON.stringify(value));
 }

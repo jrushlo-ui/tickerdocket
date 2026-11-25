@@ -1,10 +1,11 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const {DB,db}=require('./test-d1.cjs').editorialD1();
-db.exec(`CREATE TABLE subscribers(id INTEGER PRIMARY KEY,status TEXT);
+db.exec(`CREATE TABLE subscribers(id INTEGER PRIMARY KEY,status TEXT,email TEXT,created_at TEXT,confirm_hash TEXT,confirm_expires_at TEXT,unsubscribe_hash TEXT,consent_source TEXT,confirmed_at TEXT);
+ CREATE TABLE email_events(event_type TEXT,subscriber_id INTEGER,timestamp TEXT,detail TEXT);
  CREATE TABLE email_queue(edition_id INTEGER,subscriber_id INTEGER,status TEXT,UNIQUE(edition_id,subscriber_id));
  CREATE TABLE related_news(candidate_id TEXT,published_at TEXT,verified_at TEXT);
  CREATE TABLE company_mappings(applicant_norm TEXT);
- INSERT INTO subscribers VALUES(1,'active');`);
+ INSERT INTO subscribers(id,status) VALUES(1,'active');`);
 const os=require('node:os'),path=require('node:path');
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tickerdocket-publication-'));
 const bundle=path.join(dir,'worker.mjs');
@@ -41,6 +42,19 @@ async function run() {
  assert.equal((await ctx.article(new Request('https://tickerdocket.com/story/never-published'),env)).status,404);
  const index=await (await ctx.sitemap(env)).text();assert(index.includes('test%3Alater'));
  const off=await ctx.renderHome(new Request('https://tickerdocket.com/'),{DB});assert((await off.text()).includes('data-sitekey=""'));
+ const request=data=>new Request('https://tickerdocket.com/api/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+ assert.equal((await ctx.subscribe(request({email:'broken'}),env)).status,400);
+ assert.equal((await ctx.subscribe(request({email:'subscriber@example.com',agree:false}),env)).status,400);
+ let deliveries=0;
+ ctx.fetch=async(url,options)=>{
+   if (url.includes('turnstile')) return Response.json({success:options.body.get('response')==='mock-answer'});
+   assert(url.startsWith('https://api.brevo.com/'));deliveries++;return Response.json({messageId:'local-only'});
+ };
+ const input={email:'subscriber@example.com',agree:true,turnstile:'mock-answer'};
+ assert.equal((await ctx.subscribe(request(input),env)).status,200);assert.equal(deliveries,1);
+ assert.equal(db.prepare("SELECT status FROM subscribers WHERE email='subscriber@example.com'").get().status,'pending');
+ assert.equal(db.prepare("SELECT COUNT(*) n FROM email_events WHERE event_type='confirm_sent'").get().n,1);
+ const health=await ctx.coveragePage(env);assert((await health.text()).includes('https://tickerdocket.com/coverage'));
  console.log('Passed atomic publication and retry, 155-item retrieval, queue-once, real-time story, homepage coverage, signup configuration and sitemap integration.');
 }
 run().catch(e=>{console.error(e);process.exitCode=1;});
