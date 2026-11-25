@@ -932,7 +932,7 @@ async function status(env, knownEdition) {
   const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
   const {local,expected,ageHours,late}=editionTiming(edition);
   return {
-    version: "1.5.2-source-verification",
+    version: "1.5.3-source-verification",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -1154,11 +1154,6 @@ async function renderHome(request, env) {
     const editionLabel = e => e ? String(e.local_date || "") + " · " + String(e.kind || "").toUpperCase() : "CURRENT EDITION";
     const latest = data.latest || {};
     let status = !edition ? "Awaiting the first published edition." : latest.stale ? "The next edition is delayed." : !items.length ? (editionNotice(edition)) : "";
-    const board = '<aside class="docket-board" data-server-rendered="true"><div class="docket-board-head"><span>' + html(editionLabel(edition)) + '</span><span><i class="live-dot"></i> LIVE</span></div>' +
-      (status ? '<div class="docket-empty">' + html(status) + '</div>' : '') +
-      (showingPrevious ? '<div class="docket-empty">PREVIOUS EDITION · ' + html(editionLabel(previous.edition)) + '</div>' : '') +
-      displayed.slice(0,3).map(x => '<a href="/story/' + encodeURIComponent(x.candidate_id || "") + '" class="docket-line"><span class="field-label">TICKER:</span><b>' + html(x.ticker) + '</b><span class="field-label">DOCKET:</span><strong>' + html(x.title) + '</strong></a>').join("") +
-      '<div class="docket-board-foot">' + (edition && edition.kind === "morning" ? 'NEXT DOCKET / 16:30 CT' : 'NEXT DOCKET / 08:00 CT') + '</div></aside>';
     const tag = showingPrevious ? editionLabel(previous.edition) + ' · ' + displayed.length + ' ITEMS' : edition ? editionLabel(edition) + ' · ' + items.length + ' ITEMS' : 'AWAITING NEXT EDITION';
     let coverageHTML='';
     let editionAudit={}; try {editionAudit=JSON.parse(edition?.notes || '{}');} catch {}
@@ -1172,10 +1167,11 @@ async function renderHome(request, env) {
           '<p>This edition predates detailed source-by-source coverage records.</p>')+'<p><a href="/coverage">View current source checks ↗</a></p></details>';
     }
     let updates='';
+    let verified=[];
     if (edition) {
       const delta=(await env.DB.prepare(`SELECT * FROM candidates WHERE status='verified' AND
         (first_seen_at>? OR approved_at>?) ORDER BY COALESCE(approved_at,first_seen_at) DESC,id LIMIT 18`).bind(edition.published_at,edition.published_at).all()).results||[];
-      const verified=delta.filter(verifyPublicStory);
+      verified=delta.filter(verifyPublicStory);
       if (verified.length) {
         const format=new Intl.DateTimeFormat('en-US',{timeZone:'America/Chicago',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'});
         updates='<section class="section" id="since-edition"><h2>Verified since the last edition</h2><ul class="since-list">'+verified.map(x=>{
@@ -1184,7 +1180,14 @@ async function renderHome(request, env) {
         }).join('')+'</ul></section>';
       }
     }
-    const feedSection = '<section id="feed" class="section" data-server-rendered="true"><div class="section-intro"><div><p class="eyebrow">01 / ' + html(showingPrevious ? "PREVIOUS DOCKET" : edition ? String(edition.kind).toUpperCase() + " DOCKET" : "CURRENT DOCKET") + '</p><h2>' + (displayed.length ? 'Latest verified developments' : 'Edition status') + '</h2></div><span class="tag">' + html(tag) + '</span></div>' +
+    const rankedUpdates=selectMorningItems(verified,3);
+    const boardRows=verified.length ? [...rankedUpdates,...verified.filter(x=>!rankedUpdates.some(r=>r.id===x.id))] : displayed;
+    const board = '<aside class="docket-board" data-server-rendered="true"><div class="docket-board-head"><span>' + html(verified.length ? 'VERIFIED SINCE LAST EDITION' : editionLabel(edition)) + '</span><span><i class="live-dot"></i> LIVE</span></div>' +
+      (!verified.length && status ? '<div class="docket-empty">' + html(status) + '</div>' : '') +
+      (!verified.length && showingPrevious ? '<div class="docket-empty">PREVIOUS EDITION · ' + html(editionLabel(previous.edition)) + '</div>' : '') +
+      boardRows.slice(0,3).map(x => '<a href="/story/' + encodeURIComponent(x.candidate_id || x.id || "") + '" class="docket-line"><span class="field-label">TICKER:</span><b>' + html(x.ticker) + '</b><span class="field-label">DOCKET:</span><strong>' + html(x.title) + '</strong></a>').join("") +
+      '<div class="docket-board-foot">' + (edition && edition.kind === "morning" ? 'NEXT DOCKET / 16:30 CT' : 'NEXT DOCKET / 08:00 CT') + '</div></aside>';
+    const feedSection = '<section id="feed" class="section" data-server-rendered="true"><div class="section-intro"><div><p class="eyebrow">01 / ' + html(showingPrevious ? "PREVIOUS DOCKET" : edition ? String(edition.kind).toUpperCase() + " DOCKET" : "CURRENT DOCKET") + '</p><h2>' + (showingPrevious ? 'Previous edition findings' : displayed.length ? 'Edition findings' : 'Edition status') + '</h2></div><span class="tag">' + html(tag) + '</span></div>' +
       coverageHTML + (status ? '<p class="market-note"><strong>' + html(edition ? editionLabel(edition) + ' · ' : '') + html(status) + '</strong></p>' : '') +
       (showingPrevious ? '<p class="market-note">Showing the most recent edition with verified findings.</p>' : items.length ? '<p class="market-note">Primary-source regulatory actions verified for this edition.</p>' : '') +
       (displayed.length ? '<div class="feed-grid">' + displayed.map(x => {
@@ -1265,7 +1268,7 @@ var worker_default = {
       if ((p === "/" || p === "/index.html") && request.method === "GET") {
         const cache=globalThis.caches?.default;
         if (!cache) return renderHome(request,env);
-        const key=new Request(new URL('/_public-cache/v1.5.2/home',request.url).href);
+        const key=new Request(new URL('/_public-cache/v1.5.3/home',request.url).href);
         const cached=await cache.match(key);
         const response=cached || await renderHome(request,env);
         if (!cached && response.ok) {

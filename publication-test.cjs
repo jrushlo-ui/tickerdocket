@@ -37,7 +37,7 @@ async function run() {
  const env={DB,TURNSTILE_SITE_KEY:'public-key',TURNSTILE_SECRET:'test',EMAIL_POSTAL_ADDRESS:'test',BREVO_API_KEY:'test',EMAIL_LINK_SECRET:'test'};
  const api=await (await ctx.feed(new Request('https://tickerdocket.com/api/feed'),env)).json();assert.equal(api.items.length,155);
  const home=await ctx.renderHome(new Request('https://tickerdocket.com/'),env);assert.equal(home.status,200);
- const html=await home.text();assert(html.includes('id="since-edition"'));assert(html.includes('test%3Alater'));assert(html.includes('18 of 18 sources checked'));assert(html.includes('data-sitekey="public-key"'));
+ const html=await home.text();assert(html.includes('id="since-edition"'));assert(html.match(/<aside class="docket-board"[\s\S]*?<\/aside>/)[0].includes('test%3Alater'));assert(html.includes('18 of 18 sources checked'));assert(html.includes('data-sitekey="public-key"'));
  assert.equal((await ctx.article(new Request('https://tickerdocket.com/story/test%3Alater'),env)).status,200);
  assert.equal((await ctx.article(new Request('https://tickerdocket.com/story/never-published'),env)).status,404);
  const index=await (await ctx.sitemap(env)).text();assert(index.includes('test%3Alater'));
