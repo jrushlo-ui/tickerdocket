@@ -1,3 +1,5 @@
+import { describeCoverage, editionOutcome, editionNotice } from "./edition-health.mjs";
+import { evidenceFetcher } from "./source-evidence.mjs";
 import { discoverRegulatoryLeads, reviewedLaunchItems } from "./regulatory-discovery.mjs";
 import { impactCategory, morningSubject, renderMorningBrief, selectMorningItems } from "./morning-brief.mjs";
 var __defProp = Object.defineProperty;
@@ -397,7 +399,12 @@ async function saveBatch(env, records, day, manualMap, secMap) {
    impact_evidence_url=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_evidence_url ELSE candidates.impact_evidence_url END,
    impact_note=CASE WHEN (candidates.status='pending' OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%')) AND excluded.status='verified' THEN excluded.impact_note ELSE candidates.impact_note END,
    approval_method=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approval_method WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approval_method ELSE candidates.approval_method END,
-   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
+   approved_at=CASE WHEN candidates.status='pending' AND excluded.status IN ('verified','rejected') THEN excluded.approved_at WHEN candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified' THEN excluded.approved_at ELSE candidates.approved_at END
+   WHERE candidates.source_url IS NOT excluded.source_url
+      OR candidates.title IS NOT excluded.title
+      OR candidates.action_date IS NOT excluded.action_date
+      OR (candidates.status='pending' AND excluded.status IN ('verified','rejected'))
+      OR (candidates.status='rejected' AND candidates.approval_method LIKE 'auto-excluded-%' AND excluded.status='verified')`).bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type, item.action_date, item.applicant, item.device_code, day, nowISO(), nowISO(), approved ? "verified" : autoExcluded ? "rejected" : "pending", approved ? mapped.ticker : null, approved ? mapped.issuer : null, approved ? relation : null, approved ? item.source_url : null, statement, approved ? mapped.method || "admin-verified-mapping" : autoExcluded ? "auto-excluded-no-public-company" : null, approved || autoExcluded ? nowISO() : null));
       if (!existingIds.has(item.id)) {
         existingIds.add(item.id);
         inserted++;
@@ -419,20 +426,31 @@ async function triagePendingFederal(env) {
   return { reviewed: rows.length, excluded: reject.length, retained_for_review: rows.length - reject.length };
 }
 __name(triagePendingFederal, "triagePendingFederal");
-async function scanDisclosures(env, at, day) {
+async function scanDisclosures(env, at, day, fetcher = fetch) {
   const start = nowISO();
   const insert = env.DB.prepare(`INSERT OR IGNORE INTO candidates
     (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status,
      ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const reviewedInsert = env.DB.prepare(`INSERT INTO candidates
+    (id,source,source_url,title,agency,event_type,action_date,first_seen_local,first_seen_at,last_seen_at,status,
+     ticker,issuer,company_evidence_url,impact_evidence_url,impact_note,approval_method,approved_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET title=excluded.title,event_type=excluded.event_type,
+      status=excluded.status,ticker=excluded.ticker,issuer=excluded.issuer,
+      company_evidence_url=excluded.company_evidence_url,impact_evidence_url=excluded.impact_evidence_url,
+      impact_note=excluded.impact_note,approval_method=excluded.approval_method,approved_at=excluded.approved_at
+    WHERE candidates.status='pending'`);
+  const reviewedStatements = [];
   for (const item of reviewedLaunchItems) {
     const age = Date.parse(day) - Date.parse(item.action_date);
-    if (age < 0 || age > 7 * 86400000) continue;
-    await insert.bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type,
+    if (age < 0 || age > 7 * 86400000 || item.reviewed_at && Date.parse(item.reviewed_at) > at.getTime()) continue;
+    reviewedStatements.push(reviewedInsert.bind(item.id, item.source, item.source_url, item.title, item.agency, item.event_type,
       item.action_date, day, start, start, "verified", item.ticker, item.issuer, item.company_evidence_url,
-      item.source_url, item.impact_note, "editor-reviewed", start).run();
+      item.impact_evidence_url || item.source_url, item.impact_note, "editor-reviewed", start));
   }
-  const feeds = await discoverRegulatoryLeads(at.getTime());
+  if (reviewedStatements.length) await env.DB.batch(reviewedStatements);
+  const feeds = await discoverRegulatoryLeads(at.getTime(), fetcher);
   for (const feed of feeds) {
     let added = 0;
     try {
@@ -445,22 +463,24 @@ async function scanDisclosures(env, at, day) {
         const saved = await env.DB.batch(batch);
         added += saved.reduce((count, result) => count + (result.meta?.changes || 0), 0);
       }
-      await logRun(env, feed.source, start, "ok", feed.records.length, added);
+      await logRun(env, feed.source, start, feed.coverage_error ? "partial" : "ok", feed.records.length, added, feed.coverage_error);
     } catch (error) {
       await logRun(env, feed.source, start, "error", feed.records.length, added, err(error));
     }
   }
   return { sources: feeds.length, available: feeds.filter((feed) => !feed.error).length };
 }
-async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) {
+async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date(), capture = false) {
+  const evidence = capture ? evidenceFetcher(at) : null;
+  const fetcher = evidence?.fetch || fetch;
   const day = localTime(at).day, results = {};
   const manualMap = await mappings(env);
-  const disclosures = source === "all" ? scanDisclosures(env, at, day).catch((error) => ({ error: err(error) })) : null;
+  const disclosures = source === "all" ? scanDisclosures(env, at, day, fetcher).catch((error) => ({ error: err(error) })) : null;
   if (source === "all" || source === "federal") {
     const start = nowISO();
     let count = 0;
     try {
-      const r = await fetch(REGISTER, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(23e3) });
+      const r = await fetcher(REGISTER, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(23e3) });
       const data = await readJSON(r);
       if (!Array.isArray(data.results)) throw Error("Invalid Federal Register schema");
       const rows = data.results.slice(0, 500).map(fdDoc).filter(Boolean);
@@ -479,9 +499,9 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) 
       const start = nowISO();
       let count = 0;
       try {
-        const feed2 = await fetchFDAFeed(kind, at);
+        const feed2 = await fetchFDAFeed(kind, at, fetcher);
         count = feed2.decisions.length;
-        const sec = await exactSECApplicants([...new Set(feed2.decisions.map((d) => norm(d.applicant)).filter(Boolean))]);
+        const sec = await exactSECApplicants([...new Set(feed2.decisions.map((d) => norm(d.applicant)).filter(Boolean))], fetcher);
         const rows = feed2.decisions.map((d) => ({
           id: d.id,
           source: kind === "510k" ? "FDA 510(k) clearance" : "FDA PMA approval",
@@ -504,6 +524,10 @@ async function scanSource(env, source = "all", at = /* @__PURE__ */ new Date()) 
     }
   }
   if (disclosures) results.disclosures = await disclosures;
+  if (evidence) {
+    try { results.evidence = await evidence.save(env.DB); }
+    catch (error) { results.evidence = {error:err(error)}; await logRun(env, "source evidence", nowISO(), "error", 0, 0, err(error)); }
+  }
   return results;
 }
 __name(scanSource, "scanSource");
@@ -732,16 +756,17 @@ function selectEditionCutoff(previous, now = /* @__PURE__ */ new Date()) {
   return previous?.published_at || new Date(now.getTime() - 72 * 3600 * 1e3).toISOString();
 }
 __name(selectEditionCutoff, "selectEditionCutoff");
+async function sourceCoverageDetails(env, at = nowISO()) {
+  const rows = (await env.DB.prepare(`SELECT s.* FROM sync_runs s
+    WHERE s.id IN (SELECT MAX(id) FROM sync_runs WHERE ended_at <= ? GROUP BY source)`)
+    .bind(at).all()).results || [];
+  return describeCoverage(rows, at);
+}
 async function sourceCoverage(env, at = nowISO()) {
-  const rows = (await env.DB.prepare(`SELECT s.source,s.status,s.ended_at,s.error FROM sync_runs s
-   WHERE s.id IN (SELECT MAX(id) FROM sync_runs GROUP BY source)`).all()).results || [];
-  const by = Object.fromEntries(rows.map((x) => [x.source, x]));
-  const isFresh = /* @__PURE__ */ __name((x) => x && x.ended_at && Date.parse(at) - Date.parse(x.ended_at) < 75 * 6e4, "isFresh");
-  const sources = ["federal", "510k", "pma", "FDA biologics", "FDA drugs", "FDA press-releases", "FDA recalls", "CMS newsroom", "Company releases", "SEC 8-K", "SEC 6-K"];
-  return sources.every((k) => isFresh(by[k]) && by[k].status === "ok") ? "checked" : sources.some((k) => isFresh(by[k]) && ["ok", "partial"].includes(by[k].status)) ? "partial" : "incomplete";
+  return (await sourceCoverageDetails(env, at)).status;
 }
 __name(sourceCoverage, "sourceCoverage");
-async function publish(env, kind, local) {
+async function publish(env, kind, local, scanResult = null) {
   if (!["morning", "closing"].includes(kind)) throw Error("Invalid edition type");
   const exists = await latestEdition(env, local.day, kind);
   if (exists) return { already_published: true, edition_id: exists.id, items: exists.qualifying_count };
@@ -750,19 +775,23 @@ async function publish(env, kind, local) {
     ? await env.DB.prepare("SELECT * FROM editions WHERE kind='morning' AND local_date<? ORDER BY local_date DESC LIMIT 1").bind(local.day).first()
     : await latestEdition(env);
   const cutoff = selectEditionCutoff(previous, new Date(at));
-  const health = await sourceCoverage(env, at);
+  const coverage = await sourceCoverageDetails(env, at);
+  const health = coverage.status;
+  const pending = await env.DB.prepare("SELECT COUNT(*) n FROM candidates WHERE status='pending' AND first_seen_at <= ?").bind(at).first();
+  const pendingCount = pending?.n || 0;
   const selected = (await env.DB.prepare(`SELECT * FROM candidates WHERE status='verified'
+   AND first_seen_at <= ? AND (approved_at IS NULL OR approved_at <= ?)
    AND (first_seen_at > ? OR approved_at > ?)
-   ORDER BY COALESCE(approved_at,first_seen_at) DESC,id ASC LIMIT 150`).bind(cutoff, cutoff).all()).results || [];
+   ORDER BY COALESCE(approved_at,first_seen_at) DESC,id ASC LIMIT 150`).bind(at, at, cutoff, cutoff).all()).results || [];
   const qualified = selected.filter(verifyPublicStory);
   const r = await env.DB.prepare("INSERT OR IGNORE INTO editions(local_date,kind,published_at,status,scan_status,qualifying_count,notes) VALUES(?,?,?,?,?,?,?)").bind(
     local.day,
     kind,
     at,
-    qualified.length ? "published" : "no_new_verified_items",
+    editionOutcome(qualified.length, health, pendingCount),
     health,
     qualified.length,
-    "Snapshot of verified regulatory developments and documented public-company exposure. The morning edition covers the period since the previous morning edition."
+    JSON.stringify({summary:"Snapshot of verified regulatory developments and documented public-company exposure.", cutoff, source_coverage:coverage, pending_review_count:pendingCount, source_evidence:scanResult?.evidence || {status:"not_captured"}})
   ).run();
   const edition = await latestEdition(env, local.day, kind);
   if (!r.meta?.changes) return { already_published: true, edition_id: edition.id };
@@ -999,7 +1028,7 @@ async function renderHome(request, env) {
     const displayed = showingPrevious ? previous.items : items;
     const editionLabel = e => e ? String(e.local_date || "") + " · " + String(e.kind || "").toUpperCase() : "CURRENT EDITION";
     const latest = data.latest || {};
-    let status = !edition ? "Awaiting the first published edition." : latest.stale ? "The next edition is delayed." : !items.length ? (edition.scan_status === "checked" ? "No new verified findings in this edition." : "Source checks were incomplete for this edition.") : "";
+    let status = !edition ? "Awaiting the first published edition." : latest.stale ? "The next edition is delayed." : !items.length ? (editionNotice(edition)) : "";
     const board = '<aside class="docket-board" data-server-rendered="true"><div class="docket-board-head"><span>' + html(editionLabel(edition)) + '</span><span><i class="live-dot"></i> LIVE</span></div>' +
       (status ? '<div class="docket-empty">' + html(status) + '</div>' : '') +
       (showingPrevious ? '<div class="docket-empty">PREVIOUS EDITION · ' + html(editionLabel(previous.edition)) + '</div>' : '') +
@@ -1061,13 +1090,14 @@ var worker_default = {
     const plan = schedulePlan(local);
     if (plan.publish) {
       ctx.waitUntil((async () => {
+        let scanResult;
         try {
-          await scanSource(env, "all", new Date(trigger.scheduledTime));
+          scanResult = await scanSource(env, "all", new Date(trigger.scheduledTime), true);
         } catch (e) {
           console.error("Pre-edition refresh failed", err(e));
         }
         try {
-          await publish(env, plan.publish, local);
+          await publish(env, plan.publish, local, scanResult);
         } catch (e) {
           console.error("Scheduled edition failed", err(e));
         }

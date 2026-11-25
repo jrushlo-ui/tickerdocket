@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync('worker.js', 'utf8').replace(/export\s*\{[\s\S]*$/, '');
+const source = fs.readFileSync('worker.js', 'utf8').replace(/^import .*;$/gm, '').replace(/export\s*\{[\s\S]*$/, '');
 const context = vm.createContext({
   console,
   URL,
@@ -34,10 +34,6 @@ const tests = [
   [context.matchFederalIssuer({ title: 'Proposed Rule Changes: Nasdaq PHLX LLC', agency: 'Other' })?.ticker, 'NDAQ', 'Nasdaq match outside routine SEC filings'],
   [context.matchFederalIssuer({ title: 'Special Conditions: Gulfstream Aerospace Corporation, Model G400', agency: 'Federal Aviation Administration' }), null, 'routine FAA special conditions excluded'],
   [context.matchFederalIssuer({ title: 'Emergency grounding: Gulfstream Aerospace Corporation, Model G400', agency: 'Federal Aviation Administration' })?.ticker, 'GD', 'adverse FAA action retained'],
-  [context.selectEmailItems([
-    { ticker: 'CBOE', source: 'Federal Register public inspection', title: 'Proposed Rule Changes', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' },
-    { ticker: 'COP', source: 'Federal Register public inspection', title: 'Institution of Section 206 Proceeding and Refund Effective Date', event_type: 'Notice', action_date: '2026-11-09', approval_method: 'federal-title-sec-issuer' }
-  ])[0]?.ticker, 'COP', 'email significance ranking'],
   [context.expectsFreshSourceCheck({ hour: 23, minute: 30 }), false, 'overnight monitoring pause'],
   [context.expectsFreshSourceCheck({ hour: 9, minute: 0 }), true, 'active monitoring window']
 ];

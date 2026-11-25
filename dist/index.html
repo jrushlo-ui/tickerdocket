@@ -150,7 +150,8 @@
     } else if (latest.stale) {
       status = 'The next edition is delayed.';
     } else if (!items.length) {
-      status = edition.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
+      let audit = {}; try { audit = JSON.parse(edition.notes || '{}'); } catch {}
+      status = audit.pending_review_count ? `${audit.pending_review_count} discovered leads await verification. Zero verified findings does not establish that no qualifying stories occurred.` : edition.scan_status === 'checked' ? 'No new verified findings in this edition.' : 'Source checks were incomplete for this edition.';
     }
     var previousLabel = showingPrevious ? editionLabel(previous.edition) : '';
     if (board) {

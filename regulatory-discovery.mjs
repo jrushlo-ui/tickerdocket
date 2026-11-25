@@ -10,13 +10,13 @@ const FEEDS = [
   { name: 'Company releases', url: WIRE_URL },
   ...['8-K', '6-K'].map((form) => ({
     name: 'SEC ' + form,
-    url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&owner=exclude&count=40&output=atom&type=' + form,
+    url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&owner=exclude&count=100&output=atom&type=' + form,
     kind: 'sec',
   })),
 ];
 
 const REGULATORY = /\b(fda|cms|medicare|medicaid|recalls?|complete response letter|drug application|bla|nda|clearance|regulatory|antitrust|reimbursement|proposed rule|final rule|safety alert|consent decree|warning letter)\b/i;
-const ACTION = /\b(approv\w*|propos\w*|statement|clear\w*|authoriz\w*|reject\w*|declin\w*|recall\w*|rules?|guidance|delay\w*|extend\w*|extension|compliance|coverage|enforcement|investigat\w*|decision|response letter|warning letter|regulatory update)\b/i;
+const ACTION = /\b(approv\w*|accept\w*|propos\w*|statement|clear\w*|authoriz\w*|reject\w*|declin\w*|recall\w*|rules?|guidance|delay\w*|extend\w*|extension|compliance|coverage|enforcement|investigat\w*|decision|response letter|warning letter|regulatory update)\b/i;
 
 function clean(value = '') {
   return value.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
@@ -31,7 +31,7 @@ function field(xml, tag) {
 
 function makeLead(feed, title, link, timestamp, at) {
   const date = Date.parse(timestamp);
-  if (!title || !link || !Number.isFinite(date) || date > at + 86400000 || date < at - 7 * 86400000) return null;
+  if (!title || !link || !Number.isFinite(date) || date > at || date < at - 7 * 86400000) return null;
   let url;
   try {
     url = new URL(link, feed.url);
@@ -80,7 +80,10 @@ export async function discoverRegulatoryLeads(at, fetcher = fetch) {
         signal: AbortSignal.timeout(10000),
       });
       if (!response.ok) throw new Error('HTTP ' + response.status);
-      return { source: feed.name, records: parseDiscoveryFeed(feed, await response.text(), at) };
+      const body = await response.text();
+      const saturated = feed.kind === 'sec' && (body.match(/<entry(?:\s|>)/gi) || []).length >= 100;
+      return { source: feed.name, records: parseDiscoveryFeed(feed, body, at),
+        coverage_error: saturated ? 'SEC current-filings page reached 100 entries; earlier filings may be omitted' : null };
     } catch (error) {
       return { source: feed.name, records: [], error: String(error.message || error) };
     }
@@ -88,6 +91,27 @@ export async function discoverRegulatoryLeads(at, fetcher = fetch) {
 }
 
 export const reviewedLaunchItems = [
+  {
+    id: 'lead:069030d98421306f6e4e863bc225858c17982509820d9dd8794c2576787d9118',
+    action_date: '2026-11-24', reviewed_at: '2026-11-25T05:57:44.153Z',
+    ticker: 'COGT', issuer: 'Cogent Biosciences, Inc.', agency: 'FDA', source: 'FDA drugs',
+    title: 'FDA approves bezuclastinib with sunitinib for advanced gastrointestinal stromal tumors',
+    event_type: 'FDA approval',
+    source_url: 'https://www.fda.gov/drugs/cancer-approvals/fda-approves-bezuclastinib-combination-sunitinib-advanced-gastrointestinal-stromal-tumors',
+    company_evidence_url: 'https://investors.cogentbio.com/news-releases/news-release-details/cogent-biosciences-announces-fda-approval-and-launch-ekitnatm',
+    impact_note: 'FDA approved Cogent’s Ekitna (bezuclastinib) with sunitinib for previously treated advanced GIST. Cogent (Nasdaq: COGT) announced the approval and U.S. launch. This lead was discovered on November 24 and verified during the subsequent audit; it was absent from that closing edition.',
+  },
+  {
+    id: 'lead:63d93b52c26b1755f4e237aec7e4506727e165d4148ed1319e546ef1eb8f1eb8',
+    action_date: '2026-11-24', reviewed_at: '2026-11-25T05:57:44.153Z',
+    ticker: 'PYPD', issuer: 'PolyPid Ltd.', agency: 'FDA', source: 'SEC 6-K',
+    title: 'PolyPid discloses FDA approval of BACFENSSI for colorectal surgical-site infection prevention',
+    event_type: 'FDA approval',
+    source_url: 'https://www.sec.gov/Archives/edgar/data/1611842/000121390026123719/0001213900-26-123719-index.htm',
+    company_evidence_url: 'https://investors.polypid.com/news-releases/news-release-details/polypid-announces-fda-approval-bacfenssir-d-plex100-reduce',
+    impact_evidence_url: 'https://investors.polypid.com/news-releases/news-release-details/polypid-announces-fda-approval-bacfenssir-d-plex100-reduce',
+    impact_note: 'PolyPid (Nasdaq: PYPD) disclosed FDA approval of its BACFENSSI NDA. Its U.S. commercialization partner Azurity expects launch in early 2027. The filing was discovered before the November 24 close and verified during the subsequent audit; it was absent from that closing edition.',
+  },
   {
     id: 'reviewed:capr-deramiocel-crl-2026-11-20', action_date: '2026-11-20',
     ticker: 'CAPR', issuer: 'Capricor Therapeutics', agency: 'FDA', source: 'FDA biologics',
