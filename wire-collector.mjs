@@ -1,3 +1,4 @@
+import { validWireDocument } from './wire-syndication.mjs';
 import { DISCLOSURE_FEEDS } from './regulatory-discovery.mjs';
 
 const wireSources=DISCLOSURE_FEEDS.filter(f=>new URL(f.url).hostname==='www.globenewswire.com');
@@ -36,19 +37,20 @@ export async function saveWireSnapshots(DB,payload,at) {
   if (!Array.isArray(payload.feeds) || payload.feeds.length<1 || payload.feeds.length>wireSources.length) throw Error('Invalid feed set');
   const seen=new Set(),writes=[],names=[];
   for (const input of payload.feeds) {
-    const feed=wireSources.find(f=>f.name===input.source && f.url===input.url);
+    const via=input.via || 'publisher RSS collector';
+    const atom=via==='publisher Atom collector';
+    const feed=wireSources.find(f=>f.name===input.source && (atom?f.alternate:f.url)===input.url);
     const fetched=Date.parse(input.fetched_at);
     if (!feed || seen.has(feed.name) || !Number.isFinite(fetched) || fetched>at+30000 || fetched<at-15*60000 ||
-        typeof input.body!=='string' || !input.body.length || input.body.length>400000 ||
-        !/<rss\b/i.test(input.body) || !/<\/rss>/i.test(input.body) || !/<item[\s>]/i.test(input.body)) throw Error('Invalid or stale publisher feed');
+        !validWireDocument(input.body,atom)) throw Error('Invalid or stale publisher feed');
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(input.body))),x=>x.toString(16).padStart(2,'0')).join('');
     if (hash!==input.sha256) throw Error('Publisher feed digest mismatch');
-    const via=input.via || 'publisher RSS collector', origin=input.origin_updated_at || input.fetched_at;
-    if(!['syndicated index','publisher RSS collector'].includes(via) || !Number.isFinite(Date.parse(origin)) || Date.parse(origin)>at+30000) throw Error('Invalid feed provenance');
+    const origin=input.origin_updated_at || input.fetched_at;
+    if(!['syndicated index','publisher RSS collector','publisher Atom collector'].includes(via) || !Number.isFinite(Date.parse(origin)) || Date.parse(origin)>at+30000) throw Error('Invalid feed provenance');
     seen.add(feed.name);names.push(feed.name);
     writes.push(DB.prepare('INSERT OR IGNORE INTO wire_content(sha256,body) VALUES(?,?)').bind(hash,input.body),
       DB.prepare('INSERT OR IGNORE INTO wire_receipts(source,url,fetched_at,received_at,sha256) VALUES(?,?,?,?,?)')
-      .bind(feed.name,feed.url,new Date(fetched).toISOString(),new Date(at).toISOString(),hash),
+      .bind(feed.name,input.url,new Date(fetched).toISOString(),new Date(at).toISOString(),hash),
       DB.prepare('INSERT OR IGNORE INTO wire_provenance(source,fetched_at,sha256,via,origin_updated_at) VALUES(?,?,?,?,?)')
         .bind(feed.name,new Date(fetched).toISOString(),hash,via,new Date(origin).toISOString()));
   }

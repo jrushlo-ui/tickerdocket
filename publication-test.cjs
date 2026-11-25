@@ -2,7 +2,7 @@ const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/st
 const {DB,db}=require('./test-d1.cjs').editorialD1();
 db.exec(`CREATE TABLE subscribers(id INTEGER PRIMARY KEY,status TEXT,email TEXT,created_at TEXT,confirm_hash TEXT,confirm_expires_at TEXT,unsubscribe_hash TEXT,consent_source TEXT,confirmed_at TEXT);
  CREATE TABLE email_events(event_type TEXT,subscriber_id INTEGER,timestamp TEXT,detail TEXT);
- CREATE TABLE email_queue(edition_id INTEGER,subscriber_id INTEGER,status TEXT,UNIQUE(edition_id,subscriber_id));
+ CREATE TABLE email_queue(edition_id INTEGER,subscriber_id INTEGER,status TEXT DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,UNIQUE(edition_id,subscriber_id));
  CREATE TABLE related_news(candidate_id TEXT,published_at TEXT,verified_at TEXT);
  CREATE TABLE company_mappings(applicant_norm TEXT);
  INSERT INTO subscribers(id,status) VALUES(1,'active');`);
@@ -16,6 +16,10 @@ vm.runInContext(root,ctx);
 fs.rmSync(dir,{recursive:true,force:true});
 async function run() {
  await ctx.ensurePipeline(DB);
+ const names=await ctx.exactSECApplicants(['THE PROCTER AND GAMBLE COMPANY','THE AMBIGUOUS COMPANY'],async()=>Response.json({
+   fields:['cik','name','ticker','exchange'],data:[[80424,'PROCTER & GAMBLE Co','PG','NYSE'],[10,'Ambiguous Inc','AMB','NYSE'],[11,'The Ambiguous Ltd','AMG','Nasdaq']]}));
+ assert.equal(names.get('THE PROCTER AND GAMBLE COMPANY').ticker,'PG');
+ assert.equal(names.has('THE AMBIGUOUS COMPANY'),false);
  const now='2026-11-25T14:00:00.000Z',day='2026-11-25';
  ctx.nowISO=()=>now;
  const keys=vm.runInContext('EXPECTED_SOURCES',ctx);
@@ -36,8 +40,19 @@ async function run() {
  const later=row('later');later[8]='2026-11-25T15:00:00.000Z';later[15]=later[8];add.run(...later);
  const env={DB,TURNSTILE_SITE_KEY:'public-key',TURNSTILE_SECRET:'test',EMAIL_POSTAL_ADDRESS:'test',BREVO_API_KEY:'test',EMAIL_LINK_SECRET:'test'};
  const api=await (await ctx.feed(new Request('https://tickerdocket.com/api/feed'),env)).json();assert.equal(api.items.length,155);
+ const realLocal=ctx.localTime;
+ ctx.localTime=()=>({day,hour:8,minute:5,weekday:'Wed'});
+ db.prepare("INSERT INTO editions(id,local_date,kind) VALUES(900,'2026-11-20','morning'),(901,'2026-11-25','closing')").run();
+ db.prepare("INSERT INTO subscribers(id,status) VALUES(2,'active'),(3,'inactive'),(4,'active')").run();
+ db.prepare("INSERT INTO email_queue(edition_id,subscriber_id,status,attempts) VALUES(900,1,'failed',3),(900,2,'queued',0),(901,1,'queued',0),(?,3,'queued',0),(?,2,'failed',2),(?,4,'failed',3)").run(pub.edition_id,pub.edition_id,pub.edition_id);
+ const queue=await ctx.status(env);
+ assert.equal(queue.pending_emails,2);assert.equal(queue.exhausted_emails,2);
+ ctx.localTime=()=>({day,hour:12,minute:0,weekday:'Wed'});
+ assert.equal((await ctx.status(env)).pending_emails,0);
+ ctx.localTime=realLocal;
+ db.exec("DELETE FROM email_queue WHERE edition_id IN (900,901) OR subscriber_id IN (2,3,4); DELETE FROM editions WHERE id IN (900,901)");
  const home=await ctx.renderHome(new Request('https://tickerdocket.com/'),env);assert.equal(home.status,200);
- const html=await home.text();assert(html.includes('id="since-edition"'));assert(html.match(/<aside class="docket-board"[\s\S]*?<\/aside>/)[0].includes('test%3Alater'));assert(html.includes('18 of 18 sources checked'));assert(html.includes('data-sitekey="public-key"'));
+ const html=await home.text();assert(html.includes('id="since-edition"'));assert(html.match(/<aside class="docket-board"[\s\S]*?<\/aside>/)[0].includes('test%3Alater'));assert(html.includes(keys.length+' of '+keys.length+' sources checked'));assert(html.includes('data-sitekey="public-key"'));
  assert.equal((await ctx.article(new Request('https://tickerdocket.com/story/test%3Alater'),env)).status,200);
  assert.equal((await ctx.article(new Request('https://tickerdocket.com/story/never-published'),env)).status,404);
  const index=await (await ctx.sitemap(env)).text();assert(index.includes('test%3Alater'));

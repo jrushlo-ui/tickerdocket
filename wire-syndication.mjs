@@ -1,3 +1,10 @@
+export function validWireDocument(body, atom=false) {
+  if (typeof body!=='string' || body.length>400000) return false;
+  return atom
+    ? /<feed[\s>]/i.test(body) && /<entry[\s>]/i.test(body) && /<\/feed>/i.test(body)
+    : /<rss[\s>]/i.test(body) && /<item[\s>]/i.test(body) && /<\/rss>/i.test(body);
+}
+
 // A syndicated feed is a discovery index. Its crawl times never establish original release times.
 export async function syndicatedIndex(feed,at,fetcher=fetch) {
   const stream='feed/'+feed.url;

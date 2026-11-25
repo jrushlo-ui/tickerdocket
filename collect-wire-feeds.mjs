@@ -1,24 +1,32 @@
-// Only the two public publisher RSS feeds are read. No repository writes or persistent secrets.
-import {syndicatedIndex} from './wire-syndication.mjs';
+// Read the two published wire streams, preserving the transport in each receipt.
+import {syndicatedIndex,validWireDocument} from './wire-syndication.mjs';
 import {createHash} from 'node:crypto';
 import {DISCLOSURE_FEEDS} from './regulatory-discovery.mjs';
 const endpoint='https://tickerdocket.com/api/collector/wires';
 const feeds=[],failures=[];
 for (const feed of DISCLOSURE_FEEDS.filter(f=>new URL(f.url).hostname==='www.globenewswire.com')) {
-  try {
-    const response=await fetch(feed.url,{headers:{'User-Agent':'TickerDocket public filings monitor newsletter@tickerdocket.com'},signal:AbortSignal.timeout(15000)});
-    if (!response.ok) throw Error('publisher HTTP '+response.status);
-    const body=await response.text();
-    if (!/<rss\b/i.test(body) || !/<item[\s>]/i.test(body) || !/<\/rss>/i.test(body)) throw Error('invalid publisher XML');
-    feeds.push({source:feed.name,url:feed.url,fetched_at:new Date().toISOString(),sha256:createHash('sha256').update(body).digest('hex'),body});
-  } catch(error) {
-    console.log(feed.name+' direct feed: '+error.message);
+  let observation;
+  for (const url of [feed.url,feed.alternate]) {
     try {
-      const stamp=Date.now(),fallback=await syndicatedIndex(feed,stamp);
-      feeds.push({source:feed.name,url:feed.url,via:fallback.via,origin_updated_at:fallback.origin_updated_at,
-        fetched_at:fallback.fetched_at,sha256:createHash('sha256').update(fallback.body).digest('hex'),body:fallback.body});
-    } catch(other) {failures.push(feed.name+' — '+other.message);}
+      const response=await fetch(url,{headers:{'User-Agent':'TickerDocket public filings monitor newsletter@tickerdocket.com'},signal:AbortSignal.timeout(12000)});
+      if (!response.ok) throw Error('HTTP '+response.status);
+      const body=await response.text();
+      const atom=url===feed.alternate;
+      if (!validWireDocument(body,atom)) throw Error('Invalid publisher document');
+      observation={source:feed.name,url,via:atom?'publisher Atom collector':'publisher RSS collector',fetched_at:new Date().toISOString(),body};
+      break;
+    } catch(error) {console.log(feed.name+' '+new URL(url).pathname.split('/')[1]+': '+error.message);}
   }
+  if (!observation) {
+    try {
+      const snapshot=await syndicatedIndex(feed,Date.now());
+      observation={source:feed.name,url:feed.url,via:snapshot.via,origin_updated_at:snapshot.origin_updated_at,
+        fetched_at:snapshot.fetched_at,body:snapshot.body};
+    } catch(error) {failures.push(feed.name+' — '+error.message);continue;}
+  }
+  observation.sha256=createHash('sha256').update(observation.body).digest('hex');
+  feeds.push(observation);
+  console.log(feed.name+' via '+observation.via);
 }
 if (feeds.length) {
   const idURL=new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);

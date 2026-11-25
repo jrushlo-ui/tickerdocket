@@ -39,8 +39,12 @@ async function downloadDoc(url,fetcher) {
   if (!response.ok) throw Error('Primary document HTTP ' + response.status);
   const landed = response.url || String(url);
   if (!allowedArticle(landed) || new URL(landed).hostname!==new URL(url).hostname) throw Error('Document left the approved source');
+  if (Number(response.headers.get('Content-Length'))>2200000) {
+    await response.body?.cancel();
+    return {url:landed,oversized:true};
+  }
   const body=await response.text();
-  if (body.length>2200000) throw Error('Document exceeds the bounded reading window');
+  if (body.length>2200000) return {url:landed,oversized:true};
   return {url:landed,body};
 }
 function exhibitLinks(html,index) {
@@ -129,18 +133,20 @@ export async function verifyDisclosure(row,directory,fetcher=fetch) {
   if (u.hostname==='www.sec.gov' && !cik) return {outcome:'editor_review',detail:{reason:'Filing identity needs review'}};
   if (cik && !directory.ciks.has(String(Number(cik)))) return {outcome:'editor_review',detail:{reason:'Filer has no matched US exchange listing. Check parent or indirect exposure.'}};
   const doc=await downloadDoc(u.href,fetcher);
+  if (doc.oversized) return {outcome:'editor_review',detail:{reason:'Primary document exceeds the automated reading limit',primary:doc.url}};
   const links=cik ? exhibitLinks(doc.body,u.href) : [];
-  const read=[];
+  const read=[],oversized=[];
   if (!cik) {
     const result=documentDecision(row,doc,directory,null);
     if (result) return result;
   } else {
     for (const link of links.slice(0,2)) {
       const exhibit=await downloadDoc(link,fetcher);
+      if (exhibit.oversized) {oversized.push(exhibit.url);continue;}
       read.push(exhibit.url);
       const result=documentDecision(row,exhibit,directory,cik);
       if (result) return result;
     }
   }
-  return {outcome:'editor_review',detail:{reason:'Public-company impact requires additional evidence',primary:doc.url,documents_read:read,documents_remaining:Math.max(0,links.length-read.length)}};
+  return {outcome:'editor_review',detail:{reason:oversized.length?'Oversized filing exhibits require editorial review':'Public-company impact requires additional evidence',primary:doc.url,documents_read:read,oversized,documents_remaining:Math.max(0,links.length-read.length)}};
 }

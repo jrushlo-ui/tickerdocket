@@ -81,3 +81,21 @@ const observed=await readDiscoverySource(globe,end,async()=>new Response('unavai
 assert.equal(observed.records.length,1);assert.equal(observed.attempts.at(-1).sha256,hash);
 await assert.rejects(saveWireSnapshots(DB,{feeds:[{...obs,sha256:'invalid'}]},end),/digest/);
 console.log('Passed scoped workflow identity, feed integrity, freshness and independent publisher capture tests.');
+
+const alternateBody='<feed><entry><title>Issuer announces FDA approval</title><link href="https://www.globenewswire.com/news-release/example"/><updated>'+at.toISOString()+'</updated></entry></feed>';
+const alternateHash=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(alternateBody))).toString('hex');
+const alternateObservation={...obs,url:globe.alternate,via:'publisher Atom collector',body:alternateBody,sha256:alternateHash,fetched_at:new Date(end+1000).toISOString()};
+await saveWireSnapshots(DB,{feeds:[alternateObservation]},end+1000);
+assert.equal((await currentWireSnapshot(DB,globe,end+1000)).url,globe.alternate);
+await assert.rejects(saveWireSnapshots(DB,{feeds:[{...alternateObservation,url:globe.url}]},end+1000),/Invalid/);
+await assert.rejects(saveWireSnapshots(DB,{feeds:[{...alternateObservation,body:wireBody,sha256:hash}]},end+1000),/Invalid/);
+
+const blocked='lead:blocked';
+add(blocked,candidate.source_url);
+db.prepare("INSERT INTO review_attempts(candidate_id,attempted_at,outcome,detail,next_at,attempts) VALUES(?,?,'retry','{}',?,2)").run(blocked,at.toISOString(),at.toISOString());
+const blockedResult=await reviewPending(DB,at,async url=>String(url).endsWith('company_tickers_exchange.json')?Response.json(directoryJSON):new Response('Forbidden',{status:403}));
+assert.equal(blockedResult.editor_review,1);
+assert.equal(db.prepare('SELECT next_at FROM review_attempts WHERE candidate_id=?').get(blocked).next_at,null);
+const tooLarge=await verifyDisclosure(candidate,directory,async()=>new Response('over limit',{headers:{'Content-Length':'4822928'}}));
+assert.equal(tooLarge.outcome,'editor_review');
+assert.match(tooLarge.detail.reason,/reading limit/);

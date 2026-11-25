@@ -314,7 +314,7 @@ function federalNeedsReview(item) {
 }
 __name(federalNeedsReview, "federalNeedsReview");
 function legalName(s) {
-  return norm(s).replace(/\b(CORPORATION|CORP|INCORPORATED|INC|LIMITED|LTD|PLC|CO|COMPANY)\b/g, "").replace(/\s+/g, " ").trim();
+  return norm(s).replace(/^THE\s+/, "").replace(/\b(CORPORATION|CORP|INCORPORATED|INC|LIMITED|LTD|PLC|CO|COMPANY)\b/g, "").replace(/\s+/g, " ").trim();
 }
 __name(legalName, "legalName");
 async function exactSECApplicants(applicants, fetchFn = fetch) {
@@ -777,10 +777,12 @@ async function deliverMorningBrief(env, subscriber, edition, items, test = false
   const headers = test ? {} : { "List-Unsubscribe": "<" + unsubscribe + ">", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click" };
   return mail(env, subscriber.email, morningSubject(edition.local_date, test), body, headers);
 }
+const morningQueueJoins = 'FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id';
+const deliverableMorningMail = "q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' AND e.local_date=?";
 async function flushMail(env, limit = 20, day = localTime().day) {
   if (!emailReady(env)) return { sent: 0, skipped: true, reason: "Email not configured" };
   const rows = (await env.DB.prepare(
-    "SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status FROM email_queue q JOIN subscribers s ON s.id=q.subscriber_id JOIN editions e ON e.id=q.edition_id WHERE q.status IN ('queued','failed') AND q.attempts<3 AND s.status='active' AND e.kind='morning' AND e.local_date=? ORDER BY q.id ASC LIMIT ?"
+    'SELECT q.id,q.edition_id,q.subscriber_id,s.email,e.local_date,e.scan_status '+morningQueueJoins+' WHERE '+deliverableMorningMail+' ORDER BY q.id ASC LIMIT ?'
   ).bind(day, limit).all()).results || [];
   const editions = new Map();
   let sent = 0, failed = 0, cancelled = 0;
@@ -928,11 +930,13 @@ async function status(env, knownEdition) {
   const last = (await env.DB.prepare("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 8").all()).results || [];
   const edition = knownEdition === undefined ? await latestEdition(env) : knownEdition;
   const subscribers = await env.DB.prepare("SELECT COUNT(*) count FROM subscribers WHERE status='active'").first();
-  const queued = await env.DB.prepare("SELECT COUNT(*) count FROM email_queue WHERE status IN ('queued','failed')").first();
-  const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
   const {local,expected,ageHours,late}=editionTiming(edition);
+  const mailQueue = await env.DB.prepare(`SELECT COUNT(*) FILTER (WHERE ${deliverableMorningMail}) AS pending,
+    COUNT(*) FILTER (WHERE q.status='failed' AND q.attempts>=3) AS exhausted
+    ${morningQueueJoins} WHERE q.status IN ('queued','failed')`).bind(local.day).first();
+  const lastSuccess = await env.DB.prepare("SELECT MAX(ended_at) at FROM sync_runs WHERE status='ok'").first();
   return {
-    version: "1.5.3-source-verification",
+    version: "1.5.4-editorial-review",
     now: nowISO(),
     central: local,
     expected_edition: expected,
@@ -951,7 +955,8 @@ async function status(env, knownEdition) {
     },
     mail_configured: emailReady(env),
     active_subscribers: subscribers?.count || 0,
-    pending_emails: queued?.count || 0
+    pending_emails: isMarketDay(local) && local.hour<12 ? mailQueue?.pending || 0 : 0,
+    exhausted_emails: mailQueue?.exhausted || 0
   };
 }
 __name(status, "status");
@@ -992,7 +997,7 @@ async function article(req, env) {
   const title = html(item.title), canonical = base(env) + "/story/" + encodeURIComponent(id);
   const section = news.map((x) => `<li><a href="${html(x.url)}" rel="nofollow noopener noreferrer" target="_blank">${html(x.headline)}</a><small> ${html(x.publisher || "")} \xB7 ${html(x.relation)}${x.published_at ? " \xB7 " + html(x.published_at) : ""}</small></li>`).join("");
   const ld = JSON.stringify({ "@context": "https://schema.org", "@type": "NewsArticle", headline: item.title, datePublished: item.published_at || void 0, mainEntityOfPage: canonical, publisher: { "@type": "Organization", name: "TickerDocket" }, isAccessibleForFree: true }).replace(/</g, "\\u003c");
-  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} | TickerDocket</title><meta name="description" content="Verified primary-source regulatory research for ${html(item.issuer)} (${html(item.ticker)})."><link rel="canonical" href="${html(canonical)}"><link rel="stylesheet" href="/styles.css"><script type="application/ld+json">${ld}<\/script></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span>TICKER<strong>DOCKET</strong></a><nav><a href="/">Intelligence terminal</a></nav></header><main class="article-wrap"><p class="eyebrow">${html(item.agency || item.source)} \xB7 ${html(item.event_type || "regulatory action")}</p><h1>${title}</h1><p class="lede">Documented company exposure · <b>${html(item.issuer)} (${html(item.ticker)})</b></p><div class="story article"><h2>What the official record establishes</h2><p>${html(item.impact_note)}</p><p><b>Agency action date:</b> ${html(item.action_date || "Not provided by source")}</p><h2>Primary evidence</h2><p><a target="_blank" rel="noreferrer noopener" href="${html(item.source_url)}">Primary source document \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.company_evidence_url)}">Public-company / ticker evidence \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.impact_evidence_url)}">Direct exposure evidence \u2197</a></p><h2>Related reporting</h2>${news.length ? `<ul>${section}</ul>` : "<p>No independently verified related news is currently attached.</p>"}<p class="muted">This story reports a documented company relationship\u2014not a prediction that the stock will rise or fall. Regulatory action dates can precede the date the public dataset becomes available.</p></div><p><a href="/">\u2190 Back to TickerDocket</a></p></main><footer><span>\xA9 TickerDocket</span><span>Driftless Digital Ventures</span></footer></body></html>`;
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} | TickerDocket</title><meta name="description" content="Verified primary-source regulatory research for ${html(item.issuer)} (${html(item.ticker)})."><link rel="canonical" href="${html(canonical)}"><link rel="stylesheet" href="/styles.css"><script type="application/ld+json">${ld}<\/script></head><body><header class="top"><a class="brand" href="/"><span class="mark">TD</span>TICKER<strong>DOCKET</strong></a><nav><a href="/">Intelligence terminal</a></nav></header><main class="article-wrap"><p class="eyebrow">${html(item.agency || item.source)} \xB7 ${html(item.event_type || "regulatory action")}</p><h1>${title}</h1><p class="lede">Documented company exposure · <b>${html(item.issuer)} (${html(item.ticker)})</b></p><div class="story article"><h2>What the official record establishes</h2><p>${html(item.impact_note)}</p><p><b>Record date:</b> ${html(item.action_date || "Not provided by source")}</p><h2>Primary evidence</h2><p><a target="_blank" rel="noreferrer noopener" href="${html(item.source_url)}">Primary source document \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.company_evidence_url)}">Public-company / ticker evidence \u2197</a></p><p><a target="_blank" rel="noreferrer noopener" href="${html(item.impact_evidence_url)}">Direct exposure evidence \u2197</a></p><h2>Related reporting</h2>${news.length ? `<ul>${section}</ul>` : "<p>No independently verified related news is currently attached.</p>"}<p class="muted">This story reports a documented company relationship\u2014not a prediction that the stock will rise or fall. Regulatory action dates can precede the date the public dataset becomes available.</p></div><p><a href="/">\u2190 Back to TickerDocket</a></p></main><footer><span>\xA9 TickerDocket</span><span>Driftless Digital Ventures</span></footer></body></html>`;
   return new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=120", "X-Content-Type-Options": "nosniff", ...new URL(req.url).hostname.startsWith("tickerdocket-engine-v13-preview.") ? { "X-Robots-Tag": "noindex, nofollow" } : {} } });
 }
 __name(article, "article");

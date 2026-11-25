@@ -32,9 +32,10 @@ export async function reviewPending(DB,at=new Date(),fetcher=fetch,limit=7) {
       WHERE c.status='pending' AND c.id LIKE 'lead:%' AND c.first_seen_at<=?
       AND (a.candidate_id IS NULL OR a.next_at<=?)`;
     const read = (where,order,n) => DB.prepare(select+' '+where+' ORDER BY '+order+' LIMIT ?').bind(stamp,stamp,n).all();
+    const due=await read("AND a.outcome='retry'",'a.next_at,c.id',1);
     const priority=await read('',reviewPriority+',c.action_date DESC,c.first_seen_at DESC,c.id',Math.max(1,limit-2));
     const older=await read("AND c.source LIKE 'SEC %'",'c.first_seen_at,c.id',2);
-    const rows=[...new Map([...(priority.results||[]),...(older.results||[])].map(x=>[x.id,x])).values()].slice(0,limit);
+    const rows=[...new Map([...(due.results||[]),...(priority.results||[]),...(older.results||[])].map(x=>[x.id,x])).values()].slice(0,limit);
     if (!rows.length) return {examined:0};
     const directory=await issuerDirectory(fetcher);
     const since=rows.map(x=>x.action_date).filter(Boolean).sort()[0] || stamp.slice(0,10);
@@ -46,8 +47,11 @@ export async function reviewPending(DB,at=new Date(),fetcher=fetch,limit=7) {
         result=await verifyDisclosure(row,directory,fetcher);
         if (result.outcome==='verified') result=coverageDuplicate(result,existing,row);
       } catch (error) {
-        result={outcome:'retry',detail:{reason:String(error.message || error).slice(0,350)}};
-        next=new Date(at.getTime()+Math.min(24*60,15*2**Math.min(7,row.attempts||0))*60000).toISOString();
+        const reason=String(error.message || error).slice(0,350);
+        const attempts=(row.attempts||0)+1;
+        const needsEditor=attempts>=6 || attempts>=3 && /Primary document HTTP (401|403|404|410)\b/.test(reason);
+        result={outcome:needsEditor?'editor_review':'retry',detail:{reason,primary:row.source_url}};
+        if (!needsEditor) next=new Date(at.getTime()+15*2**(attempts-1)*60000).toISOString();
       }
       const writes=[];
       if (result.outcome==='verified') {
