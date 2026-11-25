@@ -16,6 +16,7 @@ export async function ensurePipeline(DB) {
       "CREATE INDEX IF NOT EXISTS docket_verified_at ON candidates(approved_at) WHERE status='verified'",
       "CREATE INDEX IF NOT EXISTS docket_pending_seen ON candidates(first_seen_at) WHERE status='pending'",
       'CREATE INDEX IF NOT EXISTS docket_run_time ON sync_runs(source,ended_at,id)',
+      "CREATE INDEX IF NOT EXISTS docket_success_time ON sync_runs(ended_at) WHERE status='ok'",
       'CREATE INDEX IF NOT EXISTS docket_item_lookup ON edition_items(candidate_id,edition_id)',
     ];
     const detail = "json_object('ticker',NEW.ticker,'issuer',NEW.issuer,'title',NEW.title,'event_type',NEW.event_type,'source',NEW.source_url,'company',NEW.company_evidence_url,'impact',NEW.impact_evidence_url,'note',NEW.impact_note,'approved_at',NEW.approved_at)";

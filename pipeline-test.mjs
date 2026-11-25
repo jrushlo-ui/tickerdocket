@@ -24,7 +24,7 @@ assert.equal(fallback.error,undefined);assert.deepEqual(fallback.attempts.map(x=
 const {db,DB}=local.localD1();
 db.exec(`CREATE TABLE candidates(id TEXT PRIMARY KEY,source TEXT,source_url TEXT,title TEXT,agency TEXT,event_type TEXT,action_date TEXT,
   first_seen_at TEXT,status TEXT,ticker TEXT,issuer TEXT,impact_note TEXT,impact_evidence_url TEXT,company_evidence_url TEXT,approval_method TEXT,approved_at TEXT);
-  CREATE TABLE sync_runs(id INTEGER PRIMARY KEY,source TEXT,ended_at TEXT);
+  CREATE TABLE sync_runs(id INTEGER PRIMARY KEY,source TEXT,ended_at TEXT,status TEXT);
   CREATE TABLE edition_items(candidate_id TEXT,edition_id INTEGER);`);
 await ensurePipeline(DB);
 const directoryJSON={fields:['cik','name','ticker','exchange'],data:[[55,'Example Research Inc.','EXRP','Nasdaq']]};
