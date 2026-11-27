@@ -1,10 +1,8 @@
 import { issuerDirectory,verifyDisclosure } from './disclosure-review.mjs';
 import { ensurePipeline } from './pipeline-store.mjs';
 
-const reviewPriority = `CASE WHEN c.source LIKE '%newsroom' AND c.source!='CMS newsroom' THEN 0
-  WHEN c.source IN ('FDA drugs','FDA biologics','FDA press-releases') AND (c.title LIKE 'FDA approv%' OR c.title LIKE '%response letter%') THEN 1
-  WHEN c.source IN ('Company releases','Business Wire Health','PR Newswire Health') THEN 2
-  WHEN c.source LIKE 'SEC %' THEN 4 ELSE 3 END`;
+import { selectReviewBatch } from './review-work.mjs';
+
 function attemptRow(DB,row,result,stamp,next) {
   return DB.prepare(`INSERT INTO review_attempts(candidate_id,attempted_at,outcome,detail,next_at)
     VALUES(?,?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET attempted_at=excluded.attempted_at,
@@ -28,14 +26,7 @@ export async function reviewPending(DB,at=new Date(),fetcher=fetch,limit=7) {
     ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pipeline_state.value<=?`).bind(lease,stamp).run();
   if (!lock.meta?.changes) return {busy:true};
   try {
-    const select = `SELECT c.*,a.attempts FROM candidates c LEFT JOIN review_attempts a ON c.id=a.candidate_id
-      WHERE c.status='pending' AND c.id LIKE 'lead:%' AND c.first_seen_at<=?
-      AND (a.candidate_id IS NULL OR a.next_at<=?)`;
-    const read = (where,order,n) => DB.prepare(select+' '+where+' ORDER BY '+order+' LIMIT ?').bind(stamp,stamp,n).all();
-    const due=await read("AND a.outcome='retry'",'a.next_at,c.id',1);
-    const priority=await read('',reviewPriority+',c.action_date DESC,c.first_seen_at DESC,c.id',Math.max(1,limit-2));
-    const older=await read("AND c.source LIKE 'SEC %'",'c.first_seen_at,c.id',2);
-    const rows=[...new Map([...(due.results||[]),...(priority.results||[]),...(older.results||[])].map(x=>[x.id,x])).values()].slice(0,limit);
+    const rows=await selectReviewBatch(DB,stamp,limit);
     if (!rows.length) return {examined:0};
     const directory=await issuerDirectory(fetcher);
     const since=rows.map(x=>x.action_date).filter(Boolean).sort()[0] || stamp.slice(0,10);

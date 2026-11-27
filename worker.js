@@ -1233,8 +1233,7 @@ async function classifyUnmatched(env) {
       SELECT id,?,CASE WHEN source LIKE 'FDA %' THEN 'ownership_review' ELSE 'policy_review' END,
         CASE WHEN source LIKE 'FDA %' THEN json_object('reason','Applicant requires verified issuer identity or parent ownership','applicant',applicant)
           ELSE json_object('reason','Federal action requires documented public-company exposure') END,NULL
-      FROM candidates WHERE status='pending' AND (id LIKE '510k:%' OR id LIKE 'pma:%' OR id LIKE 'fr-%')
-      AND NOT EXISTS(SELECT 1 FROM review_attempts a WHERE a.candidate_id=candidates.id)`).bind(nowISO()).run();
+      FROM candidates WHERE id IN (SELECT id FROM docket_review_work WHERE kind='federal')`).bind(nowISO()).run();
 }
 async function serviceReviewQueue(env,date) {
   await ensurePipeline(env.DB);

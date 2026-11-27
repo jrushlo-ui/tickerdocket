@@ -1,3 +1,4 @@
+import { ensureReviewWork } from './review-work.mjs';
 // Persist collection checkpoints, per-scan dispositions and candidate decisions independently of edition snapshots.
 const pipelineReady = new WeakMap();
 export async function ensurePipeline(DB) {
@@ -27,7 +28,7 @@ export async function ensurePipeline(DB) {
       "CREATE TRIGGER IF NOT EXISTS docket_history_no_update BEFORE UPDATE ON candidate_history BEGIN SELECT RAISE(ABORT,'Candidate history is append-only'); END",
       "CREATE TRIGGER IF NOT EXISTS docket_history_no_delete BEFORE DELETE ON candidate_history BEGIN SELECT RAISE(ABORT,'Candidate history is append-only'); END"
     );
-    pipelineReady.set(DB, DB.batch(statements.map(sql => DB.prepare(sql))).catch(error=>{pipelineReady.delete(DB);throw error;}));
+    pipelineReady.set(DB, DB.batch(statements.map(sql => DB.prepare(sql))).then(()=>ensureReviewWork(DB)).catch(error=>{pipelineReady.delete(DB);throw error;}));
   }
   return pipelineReady.get(DB);
 }

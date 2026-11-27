@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const output = process.argv[2];
 if (!output) throw Error('Provide the output path');
-const modules = ['wire-syndication.mjs','regulatory-discovery.mjs','edition-health.mjs','source-evidence.mjs','pipeline-store.mjs','wire-collector.mjs',
+const modules = ['wire-syndication.mjs','regulatory-discovery.mjs','edition-health.mjs','source-evidence.mjs','review-work.mjs','pipeline-store.mjs','wire-collector.mjs',
   'disclosure-review.mjs','review-queue.mjs','morning-brief.mjs','worker.js'];
 const templates = [['homeTemplate','dist/index.html'],['adminTemplate','dist/admin.html']]
   .map(([name,file])=>'const '+name+' = '+JSON.stringify(fs.readFileSync(file,'utf8'))+';');
